@@ -1,4 +1,25 @@
-import { useState, useMemo, useRef, useEffect, useCallback, createContext, useContext } from "react";
+import { useState, useMemo, useRef, useEffect, useCallback, createContext, useContext, Component } from "react";
+
+class ErrorBoundary extends Component {
+  constructor(props) { super(props); this.state = { error: null }; }
+  static getDerivedStateFromError(e) { return { error: e }; }
+  render() {
+    if (this.state.error) {
+      return (
+        <div style={{ fontFamily:'monospace', padding:'32px', background:'#0A0A0F', color:'#F87171', minHeight:'100vh' }}>
+          <div style={{ fontSize:'18px', fontWeight:'700', marginBottom:'12px' }}>Runtime Error</div>
+          <div style={{ fontSize:'13px', marginBottom:'8px', color:'#FCA5A5' }}>{String(this.state.error)}</div>
+          <pre style={{ fontSize:'11px', color:'#6B7280', whiteSpace:'pre-wrap' }}>{this.state.error?.stack}</pre>
+          <button onClick={() => { localStorage.clear(); window.location.reload(); }}
+            style={{ marginTop:'20px', padding:'8px 18px', borderRadius:'8px', border:'none', background:'#EF4444', color:'white', cursor:'pointer', fontSize:'13px' }}>
+            Clear storage &amp; reload
+          </button>
+        </div>
+      );
+    }
+    return this.props.children;
+  }
+}
 
 // ── Schedule engine helpers ────────────────────────────────────────────────────
 function addW(d, n) {
@@ -269,7 +290,47 @@ const STATUS_STYLES = {
   'In Progress': { bg:'#0D2235', tx:'#38BDF8', bd:'#0369A1' },
   'On Track':    { bg:'#0F1F14', tx:'#4ADE80', bd:'#166534' },
 };
-// Computes start/end from explicit dates, cascades extraDelays, detects conflicts/fragile.
+// ── Dep overrides persistence ──────────────────────────────────────────────────
+const LS_DEPS_KEY = 'interscale_dep_overrides';
+function saveDepOverrides(map) {
+  try { localStorage.setItem(LS_DEPS_KEY, JSON.stringify([...map.entries()])); } catch(e) {}
+}
+function loadDepOverrides() {
+  try { const s = localStorage.getItem(LS_DEPS_KEY); return s ? new Map(JSON.parse(s)) : new Map(); } catch(e) { return new Map(); }
+}
+
+// ── normDep: normalise a dep entry to {id, type} ─────────────────────────────
+function normDep(d) {
+  if (typeof d === 'string') return { id: d, type: 'FS' };
+  return { id: d.id, type: d.type || 'FS' };
+}
+
+// ── hasCycle: DFS — returns true if adding (fromId→toId) would create a cycle ─
+function hasCycle(fromId, toId, typedDepMap) {
+  const visited = new Set();
+  const stack = [toId];
+  while (stack.length) {
+    const cur = stack.pop();
+    if (cur === fromId) return true;
+    if (visited.has(cur)) continue;
+    visited.add(cur);
+    const deps = typedDepMap[cur] || [];
+    for (const d of deps) stack.push(normDep(d).id);
+  }
+  return false;
+}
+
+// ── Workflow persistence ───────────────────────────────────────────────────────
+// Stores reusable task templates: Map<id, {id, name, tasks:[{seq,name,role,deps,depType}]}>
+const LS_WORKFLOWS_KEY = 'interscale_workflows';
+function saveWorkflows(map) {
+  try { localStorage.setItem(LS_WORKFLOWS_KEY, JSON.stringify([...map.entries()])); } catch(e) {}
+}
+function loadWorkflows() {
+  try { const s = localStorage.getItem(LS_WORKFLOWS_KEY); return s ? new Map(JSON.parse(s)) : new Map(); } catch(e) { return new Map(); }
+}
+
+
 // rawTasks, tdepMap, base come from context — not hardcoded globals.
 function buildSched(rawTasks, tdepMap, base, extraDelays = {}, cascadeMode = 'full', completedIds = new Set(), todayMs = Date.now()) {
   if (!rawTasks || !rawTasks.length || !base) return [];
@@ -315,11 +376,20 @@ function buildSched(rawTasks, tdepMap, base, extraDelays = {}, cascadeMode = 'fu
       return actualStart;
     }
 
-    // Find latest dep end
+    // Find latest constraint from deps, respecting type
     let latestDepEnd = null;
-    for (const depId of t.deps) {
-      const depEnd = getEnd(depId);
-      if (!latestDepEnd || depEnd > latestDepEnd) latestDepEnd = depEnd;
+    for (const depRaw of (t.deps || [])) {
+      const { id: depId, type: depType } = normDep(depRaw);
+      const depType2 = depType || (tdepMap[t.id]?.find?.(d => normDep(d).id === depId) && normDep(tdepMap[t.id].find(d => normDep(d).id === depId)).type) || 'FS';
+      let constraint;
+      if (depType2 === 'SS') {
+        // Start-to-Start: this task can start when dep starts
+        constraint = getStart(depId);
+      } else {
+        // Finish-to-Start (default): this task starts after dep finishes
+        constraint = getEnd(depId);
+      }
+      if (!latestDepEnd || constraint > latestDepEnd) latestDepEnd = constraint;
     }
 
     if (latestDepEnd) {
@@ -519,16 +589,19 @@ function computeResolution(rawTasks, tdepMap, base, projs, currentDelays, curren
 // ── EditModal ─────────────────────────────────────────────────────────────────
 // Opens when user clicks a task bar or the "✎ Delay Px" toolbar buttons.
 // Shows delay slider, live impact preview, cross-project warning, and confirm step.
-function EditModal({ target, tasks, simDelays, onApply, onShift, onClose, onDelete, statusOverrides, onSetStatus, todayMs }) {
+function EditModal({ target, tasks, simDelays, onApply, onShift, onClose, onDelete, statusOverrides, onSetStatus, todayMs, onSaveDeps }) {
   const { rawTasks, projs, people, tdepMap, base, todayDay, periods } = useSched() || {};
 
   // ── All hooks must be called unconditionally before any early return ──────
   const [selectedTaskId, setSelectedTaskId] = useState('__all__');
   const [modalTab, setModalTab] = useState('shift'); // 'shift' | 'details'
   const [confirmDelete, setConfirmDelete] = useState(false);
-  const [shiftDays,    setShiftDays]    = useState(0);  // negative = backward, positive = forward
+  const [shiftDays,    setShiftDays]    = useState(0);
   const [cascadeMode,  setCascadeMode]  = useState('full');
   const [needsConfirm, setNeedsConfirm] = useState(false);
+  const [depSearch,    setDepSearch]    = useState('');
+  const [newDepType,   setNewDepType]   = useState('FS');
+  const [depError,     setDepError]     = useState('');
 
   const reset = () => setNeedsConfirm(false);
 
@@ -777,10 +850,152 @@ function EditModal({ target, tasks, simDelays, onApply, onShift, onClose, onDele
                     ].map(([k,v]) => (
                       <><div key={k+'-k'} style={{ color:MUTED, fontWeight:'500' }}>{k}</div><div key={k+'-v'} style={{ color:TEXT }}>{v||'—'}</div></>
                     ))}
-                    {depNames.length > 0 && (
-                      <><div style={{ color:MUTED, fontWeight:'500' }}>Depends on</div><div style={{ color:TEXT }}>{depNames.join(', ')}</div></>
-                    )}
                   </div>
+
+                  {/* ── Dependency management ── */}
+                  {liveTask && (() => {
+                    // Current typed deps for this task
+                    const currentDeps = (tdepMap[target.id] || []).map(normDep);
+
+                    // All tasks that could be a dep (exclude self, and tasks that would create a cycle)
+                    const candidateTasks = rawTasks
+                      .filter(t => t.id !== target.id)
+                      .filter(t => {
+                        const search = depSearch.toLowerCase();
+                        return !search || t.id.toLowerCase().includes(search) || t.name.toLowerCase().includes(search) || t.proj.toLowerCase().includes(search);
+                      })
+                      .filter(t => !currentDeps.find(d => d.id === t.id));
+
+                    const addDep = (depId) => {
+                      if (hasCycle(target.id, depId, tdepMap)) {
+                        setDepError(`Cannot add: would create a circular dependency.`);
+                        return;
+                      }
+                      setDepError('');
+                      const next = [...currentDeps, { id: depId, type: newDepType }];
+                      onSaveDeps && onSaveDeps(target.id, next);
+                      setDepSearch('');
+                    };
+
+                    const removeDep = (depId) => {
+                      setDepError('');
+                      const next = currentDeps.filter(d => d.id !== depId);
+                      onSaveDeps && onSaveDeps(target.id, next);
+                    };
+
+                    const changeDepType = (depId, type) => {
+                      const next = currentDeps.map(d => d.id === depId ? { ...d, type } : d);
+                      onSaveDeps && onSaveDeps(target.id, next);
+                    };
+
+                    const projColor2 = projColor;
+
+                    return (
+                      <div style={{ marginBottom:'18px', padding:'12px 14px', borderRadius:'10px', background:'#17171F', border:`1px solid ${BORDER}` }}>
+                        <div style={{ fontSize:'11px', fontWeight:'700', color:MUTED, textTransform:'uppercase', letterSpacing:'0.06em', marginBottom:'10px' }}>
+                          Dependencies
+                          <span style={{ marginLeft:'6px', color:MUTED, fontWeight:'400', textTransform:'none', letterSpacing:0 }}>— {currentDeps.length} link{currentDeps.length!==1?'s':''}</span>
+                        </div>
+
+                        {/* Current deps list */}
+                        {currentDeps.length === 0 && (
+                          <div style={{ fontSize:'11px', color:MUTED, marginBottom:'10px', fontStyle:'italic' }}>No dependencies set</div>
+                        )}
+                        {currentDeps.map(d => {
+                          const depTask = rawTasks.find(t => t.id === d.id);
+                          const depProj = projs.find(p => p.id === depTask?.proj);
+                          return (
+                            <div key={d.id} style={{ display:'flex', alignItems:'center', gap:'8px', marginBottom:'6px', padding:'7px 10px', borderRadius:'7px', background:'#0F0F18', border:`1px solid ${BORDER}` }}>
+                              {/* Type toggle pill */}
+                              <div style={{ display:'flex', borderRadius:'6px', overflow:'hidden', border:`1px solid ${BORDER}`, flexShrink:0 }}>
+                                {['FS','SS'].map(t => (
+                                  <button key={t} onClick={() => changeDepType(d.id, t)}
+                                    style={{ padding:'2px 8px', border:'none', cursor:'pointer', fontSize:'10px', fontWeight:'700',
+                                      background: d.type === t ? projColor2 : 'transparent',
+                                      color: d.type === t ? 'white' : MUTED }}>
+                                    {t}
+                                  </button>
+                                ))}
+                              </div>
+                              {/* Arrow */}
+                              <span style={{ fontSize:'10px', color:MUTED, flexShrink:0 }}>→</span>
+                              {/* Dep task info */}
+                              <div style={{ flex:1, minWidth:0 }}>
+                                <div style={{ fontSize:'11px', fontWeight:'600', color:depProj?.color || TEXT, overflow:'hidden', textOverflow:'ellipsis', whiteSpace:'nowrap' }}>
+                                  {d.id}
+                                </div>
+                                <div style={{ fontSize:'10px', color:MUTED, overflow:'hidden', textOverflow:'ellipsis', whiteSpace:'nowrap' }}>
+                                  {depTask?.name || '?'} · {depTask?.person || '?'}
+                                </div>
+                              </div>
+                              {/* Cross-project badge */}
+                              {depTask?.proj !== liveTask.projId && (
+                                <span style={{ fontSize:'9px', color:'#38BDF8', background:'#38BDF818', padding:'2px 6px', borderRadius:'6px', border:'1px solid #38BDF840', flexShrink:0 }}>cross-proj</span>
+                              )}
+                              {/* Remove */}
+                              <button onClick={() => removeDep(d.id)}
+                                style={{ width:'20px', height:'20px', borderRadius:'5px', border:`1px solid ${BORDER}`, background:'transparent', cursor:'pointer', color:MUTED, fontSize:'11px', display:'flex', alignItems:'center', justifyContent:'center', flexShrink:0 }}
+                                onMouseEnter={e=>e.currentTarget.style.color='#EF4444'}
+                                onMouseLeave={e=>e.currentTarget.style.color=MUTED}>✕</button>
+                            </div>
+                          );
+                        })}
+
+                        {/* Add new dep */}
+                        <div style={{ marginTop:'10px', borderTop:`1px solid ${BORDER}`, paddingTop:'10px' }}>
+                          <div style={{ fontSize:'10px', fontWeight:'700', color:MUTED, marginBottom:'6px', textTransform:'uppercase', letterSpacing:'0.05em' }}>Add dependency</div>
+                          <div style={{ display:'flex', gap:'6px', marginBottom:'6px' }}>
+                            {/* Type selector */}
+                            <div style={{ display:'flex', borderRadius:'7px', overflow:'hidden', border:`1px solid ${BORDER}`, flexShrink:0 }}>
+                              {['FS','SS'].map(t => (
+                                <button key={t} onClick={() => setNewDepType(t)}
+                                  style={{ padding:'5px 10px', border:'none', cursor:'pointer', fontSize:'11px', fontWeight:'700',
+                                    background: newDepType === t ? projColor2 : 'transparent',
+                                    color: newDepType === t ? 'white' : MUTED }}>
+                                  {t}
+                                </button>
+                              ))}
+                            </div>
+                            {/* Search input */}
+                            <input value={depSearch} onChange={e => { setDepSearch(e.target.value); setDepError(''); }}
+                              placeholder="Search task ID or name..."
+                              style={{ flex:1, padding:'5px 9px', borderRadius:'7px', border:`1px solid ${BORDER}`, background:'#0F0F18', color:TEXT, fontSize:'11px', outline:'none' }} />
+                          </div>
+
+                          {/* Candidate list */}
+                          {depSearch.trim() && (
+                            <div style={{ maxHeight:'150px', overflowY:'auto', borderRadius:'7px', border:`1px solid ${BORDER}`, background:'#0F0F18' }}>
+                              {candidateTasks.length === 0 && (
+                                <div style={{ padding:'10px', fontSize:'11px', color:MUTED, textAlign:'center' }}>No matching tasks</div>
+                              )}
+                              {candidateTasks.slice(0, 20).map(t => {
+                                const tp = projs.find(p => p.id === t.proj);
+                                const isCross = t.proj !== liveTask.projId;
+                                const wouldCycle = hasCycle(target.id, t.id, tdepMap);
+                                return (
+                                  <div key={t.id}
+                                    onClick={() => !wouldCycle && addDep(t.id)}
+                                    style={{ display:'flex', alignItems:'center', gap:'8px', padding:'8px 10px', cursor: wouldCycle ? 'not-allowed' : 'pointer', borderBottom:`1px solid ${BORDER}20`, opacity: wouldCycle ? 0.4 : 1 }}
+                                    onMouseEnter={e => { if (!wouldCycle) e.currentTarget.style.background='#1C1C27'; }}
+                                    onMouseLeave={e => e.currentTarget.style.background='transparent'}>
+                                    <div style={{ width:'7px', height:'7px', borderRadius:'50%', background:tp?.color||MUTED, flexShrink:0 }} />
+                                    <div style={{ flex:1, minWidth:0 }}>
+                                      <div style={{ fontSize:'11px', fontWeight:'600', color:tp?.color||TEXT }}>{t.id}</div>
+                                      <div style={{ fontSize:'10px', color:MUTED, overflow:'hidden', textOverflow:'ellipsis', whiteSpace:'nowrap' }}>{t.name} · {t.person}</div>
+                                    </div>
+                                    {isCross && <span style={{ fontSize:'9px', color:'#38BDF8', flexShrink:0 }}>cross-proj</span>}
+                                    {wouldCycle && <span style={{ fontSize:'9px', color:'#EF4444', flexShrink:0 }}>cycle!</span>}
+                                  </div>
+                                );
+                              })}
+                            </div>
+                          )}
+
+                          {depError && <div style={{ marginTop:'6px', fontSize:'11px', color:'#F87171' }}>{depError}</div>}
+                        </div>
+                      </div>
+                    );
+                  })()}
 
                   {/* ── Status override ── */}
                   {liveTask && (() => {
@@ -1904,9 +2119,12 @@ function ProjectGanttTab({ tasks, simDelays, setSimDelays, onEdit, setAddTasksPr
 
   // ── Filter state — owned here, not in parent ──────────────────────────────
   const [filterProj,   setFilterProj]   = useState(null); // null = All
+  const [filterPerson, setFilterPerson] = useState(null); // null = All
   const [zoomPeriod,   setZoomPeriod]   = useState(null);
-  const [filterMenuOpen, setFilterMenuOpen] = useState(false);
-  const filterMenuRef = useRef(null);
+  const [filterMenuOpen,   setFilterMenuOpen]   = useState(false);
+  const [personMenuOpen,   setPersonMenuOpen]   = useState(false);
+  const filterMenuRef  = useRef(null);
+  const personMenuRef  = useRef(null);
 
   const fp = filterProj || 'All';
 
@@ -1933,6 +2151,8 @@ function ProjectGanttTab({ tasks, simDelays, setSimDelays, onEdit, setAddTasksPr
         setAddTasksMenuOpen(false);
       if (filterMenuRef.current && !filterMenuRef.current.contains(e.target))
         setFilterMenuOpen(false);
+      if (personMenuRef.current && !personMenuRef.current.contains(e.target))
+        setPersonMenuOpen(false);
     };
     document.addEventListener('mousedown', handler);
     return () => document.removeEventListener('mousedown', handler);
@@ -1967,36 +2187,49 @@ function ProjectGanttTab({ tasks, simDelays, setSimDelays, onEdit, setAddTasksPr
       const pt = tasks.filter(t => t.projId === filterProj && t.cd > 0);
       if (pt.length) {
         const span = Math.max(...pt.map(t => t.sd + t.cd)) - Math.min(...pt.map(t => t.sd));
-        // Generous spacing for single project — fill the viewport width
+        return Math.min(48, Math.max(20, Math.floor(viewW * 0.9 / span)));
+      }
+    }
+    if (filterPerson) {
+      const pt = tasks.filter(t => t.person === filterPerson && t.cd > 0);
+      if (pt.length) {
+        const span = Math.max(...pt.map(t => t.sd + t.cd)) - Math.min(...pt.map(t => t.sd));
         return Math.min(48, Math.max(20, Math.floor(viewW * 0.9 / span)));
       }
     }
     return DPX;
-  }, [filterProj, zoomPeriod, tasks]);
+  }, [filterProj, filterPerson, zoomPeriod, tasks]);
 
   const txR = d => d * dpx;
 
   // ── Scroll to project start when filter changes ───────────────────────────
   useEffect(() => {
-    if (!filterProj) {
+    if (!filterProj && !filterPerson) {
       setShowDeps(false);
       return;
     }
     setShowDeps(true);
-    // Expand the filtered project
+    // Expand the filtered project(s)
     setExpanded(prev => {
       const next = new Set(prev);
-      next.add(filterProj);
-      ROLES.forEach(r => next.add(`${filterProj}-${r.key}`));
+      const targetProjs = filterProj ? [filterProj] : projs.map(p => p.id);
+      targetProjs.forEach(pid => {
+        next.add(pid);
+        ROLES.forEach(r => next.add(`${pid}-${r.key}`));
+      });
       return next;
     });
     requestAnimationFrame(() => {
       if (!scrollRef.current) return;
-      const pt = tasks.filter(t => t.projId === filterProj && t.cd > 0);
-      const scrollDay = pt.length ? Math.min(...pt.map(t => t.sd)) : 0;
+      const relevantTasks = filterPerson
+        ? tasks.filter(t => t.person === filterPerson && t.cd > 0)
+        : filterProj
+          ? tasks.filter(t => t.projId === filterProj && t.cd > 0)
+          : [];
+      const scrollDay = relevantTasks.length ? Math.min(...relevantTasks.map(t => t.sd)) : 0;
       scrollRef.current.scrollLeft = Math.max(0, scrollDay * dpx - 36);
     });
-  }, [filterProj, dpx]);
+  }, [filterProj, filterPerson, dpx]);
 
   const toggle = id => setExpanded(prev => {
     const next = new Set(prev);
@@ -2015,7 +2248,8 @@ function ProjectGanttTab({ tasks, simDelays, setSimDelays, onEdit, setAddTasksPr
             if (showCompleted) return true;
             const effStatus = computeStatus(t, statusOverrides, todayMs || Date.now());
             return effStatus !== 'Completed';
-          });
+          })
+          .filter(t => !filterPerson || t.person === filterPerson);
         const withDur = pt.filter(t => t.cd > 0);
         const minSd = withDur.length ? Math.min(...withDur.map(t => t.sd)) : 0;
         const maxEd = withDur.length ? Math.max(...withDur.map(t => t.sd + t.cd)) : 0;
@@ -2035,8 +2269,9 @@ function ProjectGanttTab({ tasks, simDelays, setSimDelays, onEdit, setAddTasksPr
           })
           .filter(Boolean);
         return { proj, pt, minSd, maxEd, roleGroups };
-      });
-  }, [tasks, filterProj, showCompleted, statusOverrides, todayMs]);
+      })
+      .filter(pd => pd.pt.length > 0 || !filterPerson); // hide projects with no matching tasks when filtering by person
+  }, [tasks, filterProj, filterPerson, showCompleted, statusOverrides, todayMs]);
 
   // Flat row list: proj → role → person, with y positions
   const { rowList, totalH } = useMemo(() => {
@@ -2093,20 +2328,22 @@ function ProjectGanttTab({ tasks, simDelays, setSimDelays, onEdit, setAddTasksPr
   }, [rowList, expanded, dpx]);
 
   // Dep lines — between any two tasks that both have a position in posMap
-  // Works regardless of whether tasks are in person rows or collapsed role rows
   const depLines = useMemo(() => {
     const lines = [];
     for (const pd of projData) {
       for (const t of pd.pt) {
         const toPos = posMap[t.id];
-        if (!toPos) continue; // task not visible
-        for (const depId of (tdepMap[t.id] || [])) {
+        if (!toPos) continue;
+        const rawDeps = tdepMap[t.id] || [];
+        for (const depRaw of rawDeps) {
+          const { id: depId, type: depType } = normDep(depRaw);
           const fromPos = posMap[depId];
           if (fromPos) {
             lines.push({
               from: fromPos, to: toPos,
               taskId: t.id, depId,
               projId: t.projId,
+              type: depType || 'FS',
               sameRow: Math.abs(fromPos.yc - toPos.yc) < 4,
             });
           }
@@ -2114,7 +2351,7 @@ function ProjectGanttTab({ tasks, simDelays, setSimDelays, onEdit, setAddTasksPr
       }
     }
     return lines;
-  }, [projData, posMap]);
+  }, [projData, posMap, tdepMap]);
 
   // Tasks connected to the hovered one
   const hovRelated = useMemo(() => {
@@ -2207,10 +2444,58 @@ function ProjectGanttTab({ tasks, simDelays, setSimDelays, onEdit, setAddTasksPr
           {/* Month label */}
           <span style={{ padding:'0 14px', fontSize:'13px', color:'#6B7280', borderLeft:'1px solid #2A2A3A', height:'48px', display:'flex', alignItems:'center' }}>Month</span>
 
+          {/* Resource filter */}
+          <div ref={personMenuRef} style={{ position:'relative', borderLeft:'1px solid #2A2A3A' }}>
+            <button onClick={() => setPersonMenuOpen(v => !v)}
+              style={{ display:'flex', alignItems:'center', gap:'8px', padding:'0 14px', height:'48px', border:'none', background: filterPerson ? '#10B98112' : 'none', cursor:'pointer', fontSize:'13px', fontWeight:'500', color: filterPerson ? '#10B981' : '#E8E8F0', minWidth:'140px' }}>
+              {filterPerson
+                ? <><div style={{ width:'9px', height:'9px', borderRadius:'50%', background: people.find(p=>p.name===filterPerson)?.color || '#10B981', flexShrink:0 }} />{filterPerson}</>
+                : 'All Resources'
+              }
+              <span style={{ marginLeft:'auto', color:'#6B7280', fontSize:'10px' }}>▾</span>
+            </button>
+            {personMenuOpen && (
+              <div style={{ position:'absolute', top:'calc(100% + 4px)', right:0, zIndex:100, background:'#1C1C27', borderRadius:'10px', boxShadow:'0 8px 24px rgba(0,0,0,0.6)', border:'1px solid #2A2A3A', minWidth:'200px', maxHeight:'320px', overflowY:'auto' }}>
+                <div onClick={() => { setFilterPerson(null); setPersonMenuOpen(false); }}
+                  style={{ display:'flex', alignItems:'center', gap:'10px', padding:'11px 14px', cursor:'pointer', borderBottom:'1px solid #2A2A3A',
+                    background: !filterPerson ? '#2A2A3A' : 'transparent',
+                    color: !filterPerson ? '#F97316' : '#E8E8F0',
+                    fontSize:'13px', fontWeight: !filterPerson ? '600' : '400' }}
+                  onMouseEnter={e => { if (filterPerson) e.currentTarget.style.background='#2A2A3A'; }}
+                  onMouseLeave={e => { if (filterPerson) e.currentTarget.style.background='transparent'; }}>
+                  <div style={{ width:'9px', height:'9px', borderRadius:'50%', background:'#6B7280', flexShrink:0 }} />
+                  All Resources
+                </div>
+                {people.map((per, i) => {
+                  const perTasks = tasks.filter(t => t.person === per.name);
+                  const hasConflict = perTasks.some(t => t.isC);
+                  const projCount = new Set(perTasks.map(t => t.projId)).size;
+                  return (
+                    <div key={per.name} onClick={() => { setFilterPerson(per.name); setPersonMenuOpen(false); }}
+                      style={{ display:'flex', alignItems:'center', gap:'10px', padding:'10px 14px', cursor:'pointer',
+                        borderBottom: i < people.length - 1 ? '1px solid #2A2A3A22' : 'none',
+                        background: filterPerson === per.name ? '#2A2A3A' : 'transparent',
+                        color: filterPerson === per.name ? (per.color || '#10B981') : '#E8E8F0',
+                        fontSize:'13px', fontWeight: filterPerson === per.name ? '600' : '400' }}
+                      onMouseEnter={e => { if (filterPerson !== per.name) e.currentTarget.style.background='#2A2A3A'; }}
+                      onMouseLeave={e => { if (filterPerson !== per.name) e.currentTarget.style.background='transparent'; }}>
+                      <div style={{ width:'9px', height:'9px', borderRadius:'50%', background: per.color || '#6B7280', flexShrink:0 }} />
+                      <div style={{ flex:1, minWidth:0 }}>
+                        <div style={{ fontWeight:'500', overflow:'hidden', textOverflow:'ellipsis', whiteSpace:'nowrap' }}>{per.name}</div>
+                        <div style={{ fontSize:'10px', color:'#6B7280', marginTop:'1px' }}>{per.role || '—'} · {projCount} project{projCount!==1?'s':''}</div>
+                      </div>
+                      {hasConflict && <div style={{ width:'7px', height:'7px', borderRadius:'50%', background:'#EF4444', flexShrink:0 }} />}
+                    </div>
+                  );
+                })}
+              </div>
+            )}
+          </div>
+
           {/* Project filter — custom dropdown */}
           <div ref={filterMenuRef} style={{ position:'relative', borderLeft:'1px solid #2A2A3A' }}>
             <button onClick={() => setFilterMenuOpen(v => !v)}
-              style={{ display:'flex', alignItems:'center', gap:'8px', padding:'0 14px', height:'48px', border:'none', background:'none', cursor:'pointer', fontSize:'13px', fontWeight:'500', color:'#E8E8F0', minWidth:'140px' }}>
+              style={{ display:'flex', alignItems:'center', gap:'8px', padding:'0 14px', height:'48px', border:'none', background: filterProj ? '#F9731612' : 'none', cursor:'pointer', fontSize:'13px', fontWeight:'500', color: filterProj ? '#F97316' : '#E8E8F0', minWidth:'140px' }}>
               {filterProj
                 ? <><div style={{ width:'9px', height:'9px', borderRadius:'50%', background: projs.find(p=>p.id===filterProj)?.color, flexShrink:0 }} />{filterProj}</>
                 : 'All Projects'
@@ -2620,32 +2905,59 @@ function ProjectGanttTab({ tasks, simDelays, setSimDelays, onEdit, setAddTasksPr
             {showDeps && (
               <g style={{ pointerEvents:'none' }}>
                 {depLines.map((line, i) => {
-                  const { from, to, projId, taskId, depId } = line;
+                  const { from, to, projId, taskId, depId, type: depType } = line;
                   const pc = projs.find(p => p.id === projId)?.color || '#888';
                   const isHov = hov && (hovRelated.has(taskId) || hovRelated.has(depId));
                   const opacity = hov ? (isHov ? 1 : 0.07) : 0.4;
                   const sw = isHov ? 2.5 : 1.5;
-                  const r = 4; // corner rounding radius
+                  const r = 4;
+                  const isFS = depType !== 'SS';
 
-                  // All coordinates come from posMap — already in correct pixel space
-                  const x1 = from.xe;  // right edge of dependency bar
-                  const y1 = from.yc;  // vertical centre of dependency row
-                  const x4 = to.xs;    // left edge of dependent bar
-                  const y4 = to.yc;    // vertical centre of dependent row
+                  // FS: exits right edge of dep, enters left edge of target
+                  // SS: exits left edge of dep, enters left edge of target
+                  const x1 = isFS ? from.xe : from.xs;
+                  const y1 = from.yc;
+                  const x4 = to.xs;
+                  const y4 = to.yc;
 
-                  const gap      = x4 - x1;       // positive = forward, negative = backward
-                  const rowDiff  = y4 - y1;        // positive = target is below
+                  const gap      = x4 - x1;
+                  const rowDiff  = y4 - y1;
                   const sameRow  = Math.abs(rowDiff) < 4;
                   const goDown   = rowDiff > 0;
-                  const rowGap   = Math.abs(rowDiff); // actual pixel distance between rows
-
-                  // Vertical clear: stay within the row, not the full SRH
-                  const vClear = Math.min(rowGap * 0.45, SBH * 0.6);
 
                   let pathD;
 
-                  if (sameRow && gap > 0) {
-                    // ── Forward, same row: arch above using actual pixel heights ──
+                  if (!isFS) {
+                    // ── SS routing: left exit → left entry ────────────────────
+                    // Exit left from source, loop above/below, enter left of target
+                    const loopX = Math.min(x1, x4) - 16;
+                    if (sameRow) {
+                      // Same row: loop above
+                      const archY = y1 - SBH * 0.9;
+                      pathD = [
+                        `M ${x1} ${y1}`,
+                        `L ${x1 - r} ${y1}`,
+                        `Q ${loopX} ${y1} ${loopX} ${y1 - r}`,
+                        `L ${loopX} ${archY + r}`,
+                        `Q ${loopX} ${archY} ${loopX + r} ${archY}`,
+                        `L ${x4 - r} ${archY}`,
+                        `Q ${x4} ${archY} ${x4} ${archY + r}`,
+                        `L ${x4} ${y4}`,
+                      ].join(' ');
+                    } else {
+                      // Different rows: go left to loopX, then down/up, then right to target
+                      const xMid = loopX;
+                      pathD = [
+                        `M ${x1} ${y1}`,
+                        `L ${xMid + r} ${y1}`,
+                        `Q ${xMid} ${y1} ${xMid} ${y1 + (goDown ? r : -r)}`,
+                        `L ${xMid} ${y4 + (goDown ? -r : r)}`,
+                        `Q ${xMid} ${y4} ${xMid + r} ${y4}`,
+                        `L ${x4} ${y4}`,
+                      ].join(' ');
+                    }
+                  } else if (sameRow && gap > 0) {
+                    // ── FS, same row, forward: arch above ─────────────────────
                     const archY = y1 - SBH * 0.9;
                     pathD = [
                       `M ${x1} ${y1}`,
@@ -2655,11 +2967,9 @@ function ProjectGanttTab({ tasks, simDelays, setSimDelays, onEdit, setAddTasksPr
                       `Q ${x4} ${archY} ${x4} ${archY + r}`,
                       `L ${x4} ${y4}`,
                     ].join(' ');
-
                   } else if (sameRow && gap <= 0) {
-                    // ── Backward, same row: loop below ──
+                    // ── FS, same row, backward: loop below ────────────────────
                     const loopY  = y1 + SBH * 0.9;
-                    // Loop column clears leftmost bar + 16px
                     const loopX  = Math.min(x1, x4) - 16;
                     pathD = [
                       `M ${x1} ${y1}`,
@@ -2673,10 +2983,8 @@ function ProjectGanttTab({ tasks, simDelays, setSimDelays, onEdit, setAddTasksPr
                       `Q ${loopX} ${y4} ${loopX + r} ${y4}`,
                       `L ${x4} ${y4}`,
                     ].join(' ');
-
                   } else if (gap >= r * 2) {
-                    // ── Forward, different rows: standard elbow ──
-                    // Horizontal to midpoint, vertical to target row, horizontal to bar
+                    // ── FS, forward, different rows: standard elbow ───────────
                     const xMid = x1 + Math.max(gap / 2, r + 2);
                     pathD = [
                       `M ${x1} ${y1}`,
@@ -2686,15 +2994,10 @@ function ProjectGanttTab({ tasks, simDelays, setSimDelays, onEdit, setAddTasksPr
                       `Q ${xMid} ${y4} ${xMid + r} ${y4}`,
                       `L ${x4} ${y4}`,
                     ].join(' ');
-
                   } else {
-                    // ── Backward / overlap, different rows ──
-                    // Exit right a small stub, drop/rise toward midpoint between rows,
-                    // travel left past both bars to a clear column, then come back
+                    // ── FS, backward / overlap ────────────────────────────────
                     const stub   = 10;
-                    // Clear column: always left of both bar left-edges by 16px
                     const loopX  = Math.min(x1, x4) - 16;
-                    // Midpoint between the two row centres for the horizontal segment
                     const midY   = y1 + rowDiff / 2;
                     pathD = [
                       `M ${x1} ${y1}`,
@@ -2710,15 +3013,31 @@ function ProjectGanttTab({ tasks, simDelays, setSimDelays, onEdit, setAddTasksPr
                     ].join(' ');
                   }
 
-                  // Arrowhead pointing right into target bar left edge
+                  // Arrowhead always points right into target left edge
                   const ax = x4, ay = y4;
                   const arrowPts = `${ax},${ay} ${ax-7},${ay-3.5} ${ax-7},${ay+3.5}`;
+
+                  // Type label at midpoint of path (rough midpoint)
+                  const labelX = (x1 + x4) / 2;
+                  const labelY = sameRow ? (y1 - SBH * 0.9) : (y1 + rowDiff / 2);
 
                   return (
                     <g key={i} opacity={opacity}>
                       <path d={pathD} fill="none" stroke={pc} strokeWidth={sw}
-                        strokeLinecap="round" strokeLinejoin="round" />
+                        strokeLinecap="round" strokeLinejoin="round"
+                        strokeDasharray={depType === 'SS' ? '5 3' : 'none'} />
                       <polygon points={arrowPts} fill={pc} />
+                      {/* Type label — only show when hovered or always if zoomed in */}
+                      {(isHov || dpx >= 20) && (
+                        <g>
+                          <rect x={labelX - 9} y={labelY - 7} width={18} height={13} rx="3"
+                            fill={pc} opacity="0.9" />
+                          <text x={labelX} y={labelY + 0.5} textAnchor="middle" dominantBaseline="middle"
+                            fill="white" fontSize="8" fontWeight="800" style={{ pointerEvents:'none' }}>
+                            {depType || 'FS'}
+                          </text>
+                        </g>
+                      )}
                     </g>
                   );
                 })}
@@ -2822,12 +3141,12 @@ function ProjectViewTab({ tasks, onDelete, onEdit, onToggleComplete, statusOverr
   const COLS = [
     { key:'projId',  label:'Project',   filterable:true  },
     { key:'id',      label:'Task ID',   filterable:false },
-    { key:'name',    label:'Task Name', filterable:false },
+    { key:'name',    label:'Task Name', filterable:true  },
     { key:'person',  label:'Assigned',  filterable:true  },
     { key:'role',    label:'Role',      filterable:true  },
-    { key:'rate',    label:'Rate',      filterable:false },
-    { key:'start',   label:'Start',     filterable:false },
-    { key:'end',     label:'End',       filterable:false },
+    { key:'rate',    label:'Rate',      filterable:true  },
+    { key:'start',   label:'Start',     filterable:true  },
+    { key:'end',     label:'End',       filterable:true  },
     { key:'status',  label:'Status',    filterable:true  },
     { key:'actions', label:'',          filterable:false },
   ];
@@ -3162,6 +3481,15 @@ function applyEditsToData(base, edits) {
   people = people.filter(p => activePeople.has(p.name));
 
   const tdepMap = Object.fromEntries(rawTasks.map(t => [t.id, t.deps]));
+
+  // Apply dep overrides — overlay typed deps on top of xlsx deps
+  const depOverrides = loadDepOverrides();
+  for (const [taskId, typedDeps] of depOverrides.entries()) {
+    if (rawTasks.find(t => t.id === taskId)) {
+      tdepMap[taskId] = typedDeps; // fully replaces deps for this task
+    }
+  }
+
   return { ...base, rawTasks, projs, people, tdepMap };
 }
 
@@ -3235,8 +3563,239 @@ function mutateSchedData(baseData, currentEdits, mutation) {
   return applyEditsToData(baseData, edits);
 }
 
+// ── WorkflowsTab ──────────────────────────────────────────────────────────────
+// Stores and manages reusable task templates (workflows) — project-agnostic.
+// Each workflow has: name + tasks with seq, name, role, deps (letters), depType.
+function WorkflowsTab() {
+  const BORDER = '#2A2A3A'; const TEXT = '#E8E8F0'; const MUTED = '#6B7280';
+  const ORANGE = '#F97316'; const CARD = '#1C1C27'; const BG = '#13131A';
+  const INPUT = { width:'100%', padding:'6px 9px', borderRadius:'7px', border:`1px solid ${BORDER}`, background:'#0F0F18', color:TEXT, fontSize:'12px', outline:'none', boxSizing:'border-box', fontFamily:'inherit' };
+
+  const [workflows, setWorkflows] = useState(() => loadWorkflows());
+  const [expanded,  setExpanded]  = useState(null);    // workflow id being viewed
+  const [editing,   setEditing]   = useState(null);    // {id,name,tasks} being edited, null=new
+  const [showForm,  setShowForm]  = useState(false);
+  const [formName,  setFormName]  = useState('');
+  const [formTasks, setFormTasks] = useState([{ seq:'A', name:'', role:'', deps:[], depType:'FS' }]);
+  const [formError, setFormError] = useState('');
+
+  const persist = map => { saveWorkflows(map); setWorkflows(new Map(map)); };
+
+  const openNew = () => {
+    setEditing(null);
+    setFormName('');
+    setFormTasks([{ seq:'A', name:'', role:'', deps:[], depType:'FS' }]);
+    setFormError('');
+    setShowForm(true);
+  };
+
+  const openEdit = wf => {
+    setEditing(wf);
+    setFormName(wf.name);
+    setFormTasks(wf.tasks.map(t => ({ ...t, deps: t.deps || [], depType: t.depType || 'FS' })));
+    setFormError('');
+    setShowForm(true);
+  };
+
+  const deleteWf = id => {
+    const next = new Map(workflows);
+    next.delete(id);
+    persist(next);
+    if (expanded === id) setExpanded(null);
+  };
+
+  const saveForm = () => {
+    if (!formName.trim()) { setFormError('Workflow name is required.'); return; }
+    const validTasks = formTasks.filter(t => t.name.trim());
+    if (!validTasks.length) { setFormError('Add at least one task with a name.'); return; }
+    const id = editing ? editing.id : `wf_${Date.now()}`;
+    const wf = { id, name: formName.trim(), tasks: validTasks };
+    const next = new Map(workflows);
+    next.set(id, wf);
+    persist(next);
+    setShowForm(false);
+  };
+
+  const updateFT = (i, f, v) => setFormTasks(prev => prev.map((t, idx) => idx === i ? { ...t, [f]: v } : t));
+  const addFTRow = () => {
+    const seq = String.fromCharCode(65 + formTasks.length);
+    setFormTasks(prev => [...prev, { seq, name:'', role:'', deps:[], depType:'FS' }]);
+  };
+  const removeFTRow = i => setFormTasks(prev => {
+    const next = prev.filter((_, idx) => idx !== i).map((t, idx) => ({ ...t, seq: String.fromCharCode(65 + idx) }));
+    return next.length ? next : [{ seq:'A', name:'', role:'', deps:[], depType:'FS' }];
+  });
+  const toggleDep = (i, seq) => setFormTasks(prev => prev.map((t, idx) => {
+    if (idx !== i) return t;
+    const deps = t.deps.includes(seq) ? t.deps.filter(d => d !== seq) : [...t.deps, seq];
+    return { ...t, deps };
+  }));
+
+  const wfList = [...workflows.values()];
+
+  return (
+    <div style={{ fontFamily:'-apple-system,system-ui,sans-serif' }}>
+      {/* Toolbar */}
+      <div style={{ display:'flex', alignItems:'center', padding:'0 16px', height:'48px', borderBottom:`1px solid ${BORDER}`, background:CARD, gap:'12px' }}>
+        <span style={{ fontSize:'13px', color:MUTED }}>
+          {wfList.length} workflow{wfList.length !== 1 ? 's' : ''} saved
+        </span>
+        <button onClick={openNew}
+          style={{ marginLeft:'auto', padding:'6px 14px', borderRadius:'8px', border:'none', background:ORANGE, color:'white', fontSize:'12px', fontWeight:'700', cursor:'pointer' }}>
+          + New Workflow
+        </button>
+      </div>
+
+      {/* Empty state */}
+      {wfList.length === 0 && !showForm && (
+        <div style={{ padding:'64px 32px', textAlign:'center', color:MUTED }}>
+          <div style={{ fontSize:'32px', marginBottom:'12px', opacity:0.3 }}>⚙</div>
+          <div style={{ fontSize:'14px', fontWeight:'600', marginBottom:'6px', color:TEXT, opacity:0.5 }}>No workflows yet</div>
+          <div style={{ fontSize:'12px', lineHeight:'1.6', opacity:0.6, maxWidth:'320px', margin:'0 auto' }}>
+            Create a reusable task template — task names, roles, and dependencies without project-specific details.
+          </div>
+          <button onClick={openNew} style={{ marginTop:'16px', padding:'8px 18px', borderRadius:'8px', border:`1px solid ${BORDER}`, background:'transparent', color:TEXT, fontSize:'12px', cursor:'pointer' }}>
+            Create first workflow
+          </button>
+        </div>
+      )}
+
+      {/* Workflow list */}
+      {!showForm && wfList.length > 0 && (
+        <div>
+          {/* Table header */}
+          <div style={{ display:'grid', gridTemplateColumns:'1fr 80px 80px', gap:'0', borderBottom:`1px solid ${BORDER}`, background:'#0A0A0F' }}>
+            {['Workflow Name', 'Tasks', ''].map((h, i) => (
+              <div key={i} style={{ padding:'10px 16px', fontSize:'11px', color:MUTED, fontWeight:'700', textTransform:'uppercase', letterSpacing:'0.06em' }}>{h}</div>
+            ))}
+          </div>
+          {wfList.map((wf, wi) => (
+            <div key={wf.id}>
+              {/* Row */}
+              <div style={{ display:'grid', gridTemplateColumns:'1fr 80px 80px', background: wi%2===0 ? BG : '#0F0F18', borderBottom:`1px solid ${BORDER}` }}
+                onMouseEnter={e=>e.currentTarget.style.background='#1E2535'}
+                onMouseLeave={e=>e.currentTarget.style.background=wi%2===0?BG:'#0F0F18'}>
+                <div style={{ padding:'12px 16px', display:'flex', alignItems:'center', gap:'10px', cursor:'pointer' }}
+                  onClick={() => setExpanded(expanded === wf.id ? null : wf.id)}>
+                  <span style={{ fontSize:'10px', color:MUTED, transition:'transform 0.15s', display:'inline-block', transform: expanded===wf.id ? 'rotate(90deg)' : 'none' }}>▶</span>
+                  <span style={{ fontWeight:'600', color:TEXT, fontSize:'13px' }}>{wf.name}</span>
+                </div>
+                <div style={{ padding:'12px 16px', color:MUTED, fontSize:'13px', display:'flex', alignItems:'center' }}>{wf.tasks.length}</div>
+                <div style={{ padding:'8px 12px', display:'flex', alignItems:'center', gap:'6px', justifyContent:'flex-end' }}>
+                  <button onClick={() => openEdit(wf)}
+                    style={{ width:'26px', height:'26px', borderRadius:'6px', border:`1px solid ${BORDER}`, background:'transparent', cursor:'pointer', color:MUTED, fontSize:'13px', display:'flex', alignItems:'center', justifyContent:'center' }}
+                    onMouseEnter={e=>e.currentTarget.style.color=ORANGE} onMouseLeave={e=>e.currentTarget.style.color=MUTED}>✎</button>
+                  <button onClick={() => deleteWf(wf.id)}
+                    style={{ width:'26px', height:'26px', borderRadius:'6px', border:`1px solid ${BORDER}`, background:'transparent', cursor:'pointer', color:MUTED, fontSize:'13px', display:'flex', alignItems:'center', justifyContent:'center' }}
+                    onMouseEnter={e=>e.currentTarget.style.color='#EF4444'} onMouseLeave={e=>e.currentTarget.style.color=MUTED}>🗑</button>
+                </div>
+              </div>
+              {/* Expanded task list */}
+              {expanded === wf.id && (
+                <div style={{ background:'#0A0A0F', borderBottom:`1px solid ${BORDER}`, padding:'10px 24px 14px' }}>
+                  <div style={{ display:'grid', gridTemplateColumns:'32px 1fr 120px 120px', gap:'0', marginBottom:'6px' }}>
+                    {['Seq','Task Name','Role','Deps'].map((h,i) => (
+                      <div key={i} style={{ padding:'5px 8px', fontSize:'10px', color:MUTED, fontWeight:'700', textTransform:'uppercase', letterSpacing:'0.06em' }}>{h}</div>
+                    ))}
+                  </div>
+                  {wf.tasks.map((t, ti) => (
+                    <div key={ti} style={{ display:'grid', gridTemplateColumns:'32px 1fr 120px 120px', gap:'0', borderTop:`1px solid ${BORDER}20` }}>
+                      <div style={{ padding:'7px 8px', fontSize:'12px', fontWeight:'700', color:ORANGE }}>{t.seq}</div>
+                      <div style={{ padding:'7px 8px', fontSize:'12px', color:TEXT }}>{t.name}</div>
+                      <div style={{ padding:'7px 8px', fontSize:'12px', color:MUTED }}>{t.role || '—'}</div>
+                      <div style={{ padding:'7px 8px', fontSize:'11px', color:MUTED }}>
+                        {t.deps?.length ? t.deps.map(d => (
+                          <span key={d} style={{ marginRight:'4px', padding:'1px 5px', borderRadius:'4px', background:`${ORANGE}18`, border:`1px solid ${ORANGE}40`, color:ORANGE, fontSize:'10px', fontWeight:'700' }}>
+                            {t.depType || 'FS'}:{d}
+                          </span>
+                        )) : '—'}
+                      </div>
+                    </div>
+                  ))}
+                </div>
+              )}
+            </div>
+          ))}
+        </div>
+      )}
+
+      {/* Create / Edit form */}
+      {showForm && (
+        <div style={{ padding:'20px 22px' }}>
+          <div style={{ display:'flex', alignItems:'center', justifyContent:'space-between', marginBottom:'16px' }}>
+            <div style={{ fontSize:'14px', fontWeight:'700', color:TEXT }}>{editing ? `Edit: ${editing.name}` : 'New Workflow'}</div>
+            <button onClick={() => setShowForm(false)} style={{ background:'none', border:'none', cursor:'pointer', color:MUTED, fontSize:'20px' }}>×</button>
+          </div>
+
+          {/* Workflow name */}
+          <div style={{ marginBottom:'16px' }}>
+            <div style={{ fontSize:'11px', color:MUTED, marginBottom:'5px', fontWeight:'600' }}>Workflow Name</div>
+            <input value={formName} onChange={e => setFormName(e.target.value)} placeholder="e.g. Standard Fit-Out, Heritage Reno…"
+              style={{ ...INPUT, maxWidth:'360px' }} />
+          </div>
+
+          {/* Task grid */}
+          <div style={{ marginBottom:'14px' }}>
+            <div style={{ fontSize:'11px', color:MUTED, marginBottom:'8px', fontWeight:'600', textTransform:'uppercase', letterSpacing:'0.06em' }}>Tasks</div>
+            <div style={{ display:'grid', gridTemplateColumns:'32px 1fr 120px 140px 24px', gap:'6px', marginBottom:'6px', paddingBottom:'6px', borderBottom:`1px solid ${BORDER}` }}>
+              {['Seq','Task Name','Role','Dependencies',''].map((h,i) => (
+                <div key={i} style={{ fontSize:'10px', color:MUTED, fontWeight:'700', textTransform:'uppercase', letterSpacing:'0.05em' }}>{h}</div>
+              ))}
+            </div>
+            {formTasks.map((t, i) => {
+              const prevSeqs = formTasks.slice(0, i).map(x => x.seq);
+              return (
+                <div key={i} style={{ display:'grid', gridTemplateColumns:'32px 1fr 120px 140px 24px', gap:'6px', marginBottom:'6px', alignItems:'center' }}>
+                  <div style={{ fontSize:'12px', fontWeight:'700', color:ORANGE, textAlign:'center', background:'#F9731615', borderRadius:'5px', padding:'6px 0', border:`1px solid ${ORANGE}40` }}>{t.seq}</div>
+                  <input value={t.name} onChange={e => updateFT(i,'name',e.target.value)} placeholder="Task name" style={INPUT} />
+                  <input value={t.role} onChange={e => updateFT(i,'role',e.target.value)} placeholder="Role" style={INPUT} />
+                  {/* Dep selector */}
+                  <div style={{ display:'flex', gap:'4px', flexWrap:'wrap', alignItems:'center' }}>
+                    {/* Type toggle */}
+                    <div style={{ display:'flex', borderRadius:'6px', overflow:'hidden', border:`1px solid ${BORDER}`, flexShrink:0 }}>
+                      {['FS','SS'].map(tp => (
+                        <button key={tp} onClick={() => updateFT(i,'depType',tp)}
+                          style={{ padding:'3px 7px', border:'none', cursor:'pointer', fontSize:'10px', fontWeight:'700', background: t.depType===tp ? ORANGE : 'transparent', color: t.depType===tp ? 'white' : MUTED }}>
+                          {tp}
+                        </button>
+                      ))}
+                    </div>
+                    {/* Dep letter toggles */}
+                    {prevSeqs.map(seq => (
+                      <button key={seq} onClick={() => toggleDep(i, seq)}
+                        style={{ padding:'3px 8px', borderRadius:'5px', border:`1px solid ${t.deps.includes(seq) ? ORANGE : BORDER}`, background: t.deps.includes(seq) ? '#F9731620' : 'transparent', cursor:'pointer', fontSize:'10px', fontWeight:'700', color: t.deps.includes(seq) ? ORANGE : MUTED }}>
+                        {seq}
+                      </button>
+                    ))}
+                    {prevSeqs.length === 0 && <span style={{ fontSize:'10px', color:MUTED, fontStyle:'italic' }}>—</span>}
+                  </div>
+                  <button onClick={() => removeFTRow(i)} disabled={formTasks.length === 1}
+                    style={{ width:'24px', height:'24px', borderRadius:'5px', border:`1px solid ${BORDER}`, background:'transparent', color:MUTED, cursor:formTasks.length===1?'default':'pointer', fontSize:'14px', display:'flex', alignItems:'center', justifyContent:'center', opacity:formTasks.length===1?0.3:1 }}>×</button>
+                </div>
+              );
+            })}
+            <button onClick={addFTRow}
+              style={{ display:'flex', alignItems:'center', gap:'6px', marginTop:'4px', padding:'6px 12px', borderRadius:'7px', border:`1px dashed ${BORDER}`, background:'transparent', color:MUTED, fontSize:'12px', cursor:'pointer', width:'100%', justifyContent:'center' }}
+              onMouseEnter={e=>e.currentTarget.style.borderColor=ORANGE} onMouseLeave={e=>e.currentTarget.style.borderColor=BORDER}>
+              + Add task
+            </button>
+          </div>
+
+          {formError && <div style={{ marginBottom:'12px', padding:'8px 12px', borderRadius:'7px', background:'#3B1219', border:'1px solid #7F1D1D', color:'#FCA5A5', fontSize:'12px' }}>{formError}</div>}
+
+          <div style={{ display:'flex', gap:'10px', justifyContent:'flex-end' }}>
+            <button onClick={() => setShowForm(false)} style={{ padding:'8px 16px', borderRadius:'8px', border:`1px solid ${BORDER}`, background:'transparent', color:MUTED, fontSize:'13px', cursor:'pointer' }}>Cancel</button>
+            <button onClick={saveForm} style={{ padding:'8px 20px', borderRadius:'8px', border:'none', background:ORANGE, color:'white', fontSize:'13px', fontWeight:'700', cursor:'pointer' }}>
+              {editing ? 'Save Changes' : 'Save Workflow'}
+            </button>
+          </div>
+        </div>
+      )}
+    </div>
+  );
+}
+
 // ── AddTasksModal ─────────────────────────────────────────────────────────────
-// Adds tasks to an existing project. Lighter than NewProjectModal — project is locked.
 function AddTasksModal({ proj, existingTasks, existingPeople, onAdd, onClose }) {
   const CARD   = '#1C1C27';
   const BORDER = '#2A2A3A';
@@ -3245,7 +3804,6 @@ function AddTasksModal({ proj, existingTasks, existingPeople, onAdd, onClose }) 
   const MUTED  = '#6B7280';
   const INPUT  = { width:'100%', padding:'8px 10px', borderRadius:'8px', border:`1px solid ${BORDER}`, background:'#0F0F18', color:TEXT, fontSize:'12px', outline:'none', boxSizing:'border-box', fontFamily:'inherit' };
 
-  // Auto-letter new tasks after existing ones
   const nextLetter = () => {
     const used = existingTasks.map(t => t.id.split('-')[1] || '').filter(Boolean);
     for (let i = 0; i < 26; i++) {
@@ -3256,11 +3814,19 @@ function AddTasksModal({ proj, existingTasks, existingPeople, onAdd, onClose }) 
   };
 
   const [tasks, setTasks] = useState([
-    { seq: nextLetter(), name:'', person:'', role:'', rate:'', start:'', end:'', deps:'' }
+    { seq: nextLetter(), name:'', person:'', role:'', rate:'', start:'', end:'', deps:[], depType:'FS' }
   ]);
   const [error, setError] = useState('');
+  const [workflows] = useState(() => loadWorkflows());
 
   const updateTask = (i, f, v) => setTasks(prev => prev.map((t, idx) => idx===i ? {...t,[f]:v} : t));
+
+  const toggleDep = (i, seq) => setTasks(prev => prev.map((t, idx) => {
+    if (idx !== i) return t;
+    const deps = t.deps.includes(seq) ? t.deps.filter(d => d !== seq) : [...t.deps, seq];
+    return { ...t, deps };
+  }));
+
   const addRow = () => {
     const used = [...existingTasks.map(t => t.id.split('-')[1]), ...tasks.map(t => t.seq)];
     let seq = 'A';
@@ -3268,14 +3834,30 @@ function AddTasksModal({ proj, existingTasks, existingPeople, onAdd, onClose }) 
       const l = i < 26 ? String.fromCharCode(65+i) : String.fromCharCode(65+i-26).repeat(2);
       if (!used.includes(l)) { seq = l; break; }
     }
-    setTasks(prev => [...prev, { seq, name:'', person:'', role:'', rate:'', start:'', end:'', deps:'' }]);
+    setTasks(prev => [...prev, { seq, name:'', person:'', role:'', rate:'', start:'', end:'', deps:[], depType:'FS' }]);
   };
+
   const removeRow = i => setTasks(prev => prev.filter((_, idx) => idx !== i));
+
+  const loadWorkflow = wfId => {
+    const wf = workflows.get(wfId);
+    if (!wf) return;
+    const used = existingTasks.map(t => t.id.split('-')[1] || '');
+    let letterIdx = 0;
+    const nextSeq = () => {
+      while (letterIdx < 26 && used.includes(String.fromCharCode(65+letterIdx))) letterIdx++;
+      return String.fromCharCode(65 + (letterIdx++));
+    };
+    const newRows = wf.tasks.map(t => ({
+      seq: nextSeq(), name: t.name, person:'', role: t.role||'', rate:'', start:'', end:'',
+      deps: t.deps || [], depType: t.depType || 'FS',
+    }));
+    setTasks(newRows);
+  };
 
   const handleAdd = () => {
     const valid = tasks.filter(t => t.name.trim() && t.start.trim() && t.end.trim());
     if (!valid.length) { setError('Each task needs a name, start date, and end date.'); return; }
-
     const newTasks = valid.map(t => ({
       id: `${proj.id}-${t.seq}`,
       proj: proj.id,
@@ -3285,11 +3867,16 @@ function AddTasksModal({ proj, existingTasks, existingPeople, onAdd, onClose }) 
       dur: 1,
       start: t.start.trim(),
       end: t.end.trim(),
-      deps: t.deps ? t.deps.split(/[,;]+/).map(d => {
-        const c = d.trim(); if (!c) return null;
-        return c.includes('-') ? c : `${proj.id}-${c}`;
-      }).filter(Boolean) : [],
+      deps: t.deps.map(d => `${proj.id}-${d}`),
     }));
+    // Save typed deps via depOverrides
+    const depMap = loadDepOverrides();
+    for (const t of valid) {
+      if (t.deps.length) {
+        depMap.set(`${proj.id}-${t.seq}`, t.deps.map(d => ({ id:`${proj.id}-${d}`, type: t.depType })));
+      }
+    }
+    saveDepOverrides(depMap);
 
     const newPeople = [];
     for (const t of newTasks) {
@@ -3299,15 +3886,16 @@ function AddTasksModal({ proj, existingTasks, existingPeople, onAdd, onClose }) 
         newPeople.push({ name:t.person, role:src?.role||'', init, color:PERSON_COLORS[existingPeople.length % PERSON_COLORS.length], rate:src?.rate||'$42/hr' });
       }
     }
-
     onAdd({ tasks:newTasks, people:newPeople });
     onClose();
   };
 
+  const wfList = [...workflows.values()];
+
   return (
     <div style={{ position:'fixed', inset:0, zIndex:1000, background:'rgba(10,10,15,0.7)', backdropFilter:'blur(4px)', display:'flex', alignItems:'center', justifyContent:'center' }}
       onClick={e => { if (e.target===e.currentTarget) onClose(); }}>
-      <div style={{ background:CARD, borderRadius:'16px', width:'600px', maxWidth:'95vw', maxHeight:'85vh', display:'flex', flexDirection:'column', boxShadow:'0 24px 64px rgba(0,0,0,0.5)', border:`1px solid ${BORDER}`, overflow:'hidden' }}>
+      <div style={{ background:CARD, borderRadius:'16px', width:'700px', maxWidth:'95vw', maxHeight:'85vh', display:'flex', flexDirection:'column', boxShadow:'0 24px 64px rgba(0,0,0,0.5)', border:`1px solid ${BORDER}`, overflow:'hidden' }}>
         <div style={{ padding:'18px 22px 14px', borderBottom:`2px solid ${proj.color}`, background:'#17171F', flexShrink:0 }}>
           <div style={{ display:'flex', alignItems:'center', justifyContent:'space-between' }}>
             <div>
@@ -3322,23 +3910,56 @@ function AddTasksModal({ proj, existingTasks, existingPeople, onAdd, onClose }) 
         </div>
 
         <div style={{ overflowY:'auto', flex:1, padding:'18px 22px' }}>
-          <div style={{ display:'grid', gridTemplateColumns:'36px 1fr 100px 90px 90px 80px 24px', gap:'6px', marginBottom:'8px', paddingBottom:'6px', borderBottom:`1px solid ${BORDER}` }}>
-            {['ID','Task Name','Assigned','Start','End','Deps',''].map((h,i) => (
+          {/* Workflow loader */}
+          {wfList.length > 0 && (
+            <div style={{ marginBottom:'16px', padding:'10px 14px', borderRadius:'9px', background:'#17171F', border:`1px solid ${BORDER}`, display:'flex', alignItems:'center', gap:'10px' }}>
+              <span style={{ fontSize:'11px', color:MUTED, fontWeight:'600', flexShrink:0 }}>Load workflow:</span>
+              <select onChange={e => { if (e.target.value) loadWorkflow(e.target.value); e.target.value=''; }}
+                style={{ flex:1, padding:'5px 9px', borderRadius:'7px', border:`1px solid ${BORDER}`, background:'#0F0F18', color:TEXT, fontSize:'12px', outline:'none', cursor:'pointer' }}>
+                <option value=''>— select a workflow —</option>
+                {wfList.map(wf => <option key={wf.id} value={wf.id}>{wf.name} ({wf.tasks.length} tasks)</option>)}
+              </select>
+            </div>
+          )}
+
+          {/* Column headers */}
+          <div style={{ display:'grid', gridTemplateColumns:'36px 1fr 100px 90px 90px 150px 24px', gap:'6px', marginBottom:'8px', paddingBottom:'6px', borderBottom:`1px solid ${BORDER}` }}>
+            {['ID','Task Name','Assigned','Start','End','Dependencies',''].map((h,i) => (
               <div key={i} style={{ fontSize:'10px', color:MUTED, fontWeight:'600', textTransform:'uppercase', letterSpacing:'0.05em' }}>{h}</div>
             ))}
           </div>
-          {tasks.map((t, i) => (
-            <div key={i} style={{ display:'grid', gridTemplateColumns:'36px 1fr 100px 90px 90px 80px 24px', gap:'6px', marginBottom:'6px', alignItems:'center' }}>
-              <div style={{ fontSize:'11px', fontWeight:'700', color:proj.color, textAlign:'center', background:proj.color+'15', borderRadius:'5px', padding:'6px 0', border:`1px solid ${proj.color}40`, whiteSpace:'nowrap', overflow:'hidden', textOverflow:'ellipsis' }}>{proj.id}-{t.seq}</div>
-              <input value={t.name}   onChange={e=>updateTask(i,'name',  e.target.value)} placeholder="Task name"   style={INPUT} />
-              <input value={t.person} onChange={e=>updateTask(i,'person',e.target.value)} placeholder="Name" list="known-people-add" style={INPUT} />
-              <input value={t.start}  onChange={e=>updateTask(i,'start', e.target.value)} placeholder="DD/MM/YYYY" style={INPUT} />
-              <input value={t.end}    onChange={e=>updateTask(i,'end',   e.target.value)} placeholder="DD/MM/YYYY" style={INPUT} />
-              <input value={t.deps}   onChange={e=>updateTask(i,'deps',  e.target.value)} placeholder="A, B" style={INPUT} />
-              <button onClick={()=>removeRow(i)} disabled={tasks.length===1}
-                style={{ width:'24px', height:'24px', borderRadius:'5px', border:`1px solid ${BORDER}`, background:'transparent', color:MUTED, cursor:tasks.length===1?'default':'pointer', fontSize:'14px', display:'flex', alignItems:'center', justifyContent:'center', flexShrink:0, opacity:tasks.length===1?0.3:1 }}>×</button>
-            </div>
-          ))}
+          {tasks.map((t, i) => {
+            const prevSeqs = tasks.slice(0, i).map(x => x.seq);
+            return (
+              <div key={i} style={{ display:'grid', gridTemplateColumns:'36px 1fr 100px 90px 90px 150px 24px', gap:'6px', marginBottom:'6px', alignItems:'center' }}>
+                <div style={{ fontSize:'11px', fontWeight:'700', color:proj.color, textAlign:'center', background:proj.color+'15', borderRadius:'5px', padding:'6px 0', border:`1px solid ${proj.color}40`, whiteSpace:'nowrap', overflow:'hidden', textOverflow:'ellipsis' }}>{proj.id}-{t.seq}</div>
+                <input value={t.name}   onChange={e=>updateTask(i,'name',  e.target.value)} placeholder="Task name"   style={INPUT} />
+                <input value={t.person} onChange={e=>updateTask(i,'person',e.target.value)} placeholder="Name" list="known-people-add" style={INPUT} />
+                <input value={t.start}  onChange={e=>updateTask(i,'start', e.target.value)} placeholder="DD/MM/YYYY" style={INPUT} />
+                <input value={t.end}    onChange={e=>updateTask(i,'end',   e.target.value)} placeholder="DD/MM/YYYY" style={INPUT} />
+                {/* Dep type + letter selector */}
+                <div style={{ display:'flex', gap:'4px', flexWrap:'wrap', alignItems:'center' }}>
+                  <div style={{ display:'flex', borderRadius:'6px', overflow:'hidden', border:`1px solid ${BORDER}`, flexShrink:0 }}>
+                    {['FS','SS'].map(tp => (
+                      <button key={tp} onClick={() => updateTask(i,'depType',tp)}
+                        style={{ padding:'3px 7px', border:'none', cursor:'pointer', fontSize:'10px', fontWeight:'700', background: t.depType===tp ? proj.color : 'transparent', color: t.depType===tp ? 'white' : MUTED }}>
+                        {tp}
+                      </button>
+                    ))}
+                  </div>
+                  {prevSeqs.map(seq => (
+                    <button key={seq} onClick={() => toggleDep(i, seq)}
+                      style={{ padding:'3px 8px', borderRadius:'5px', border:`1px solid ${t.deps.includes(seq) ? proj.color : BORDER}`, background: t.deps.includes(seq) ? proj.color+'20' : 'transparent', cursor:'pointer', fontSize:'10px', fontWeight:'700', color: t.deps.includes(seq) ? proj.color : MUTED }}>
+                      {seq}
+                    </button>
+                  ))}
+                  {prevSeqs.length === 0 && <span style={{ fontSize:'10px', color:MUTED, fontStyle:'italic' }}>—</span>}
+                </div>
+                <button onClick={()=>removeRow(i)} disabled={tasks.length===1}
+                  style={{ width:'24px', height:'24px', borderRadius:'5px', border:`1px solid ${BORDER}`, background:'transparent', color:MUTED, cursor:tasks.length===1?'default':'pointer', fontSize:'14px', display:'flex', alignItems:'center', justifyContent:'center', flexShrink:0, opacity:tasks.length===1?0.3:1 }}>×</button>
+              </div>
+            );
+          })}
           <datalist id="known-people-add">{existingPeople.map(p=><option key={p.name} value={p.name}/>)}</datalist>
           <button onClick={addRow}
             style={{ display:'flex', alignItems:'center', gap:'6px', marginTop:'6px', padding:'6px 12px', borderRadius:'7px', border:`1px dashed ${BORDER}`, background:'transparent', color:MUTED, fontSize:'12px', cursor:'pointer', width:'100%', justifyContent:'center' }}
@@ -3369,76 +3990,82 @@ function NewProjectModal({ existingProjs, existingPeople, onAdd, onClose }) {
   const MUTED  = '#6B7280';
   const INPUT  = { width:'100%', padding:'8px 10px', borderRadius:'8px', border:`1px solid ${BORDER}`, background:'#0F0F18', color:TEXT, fontSize:'12px', outline:'none', boxSizing:'border-box', fontFamily:'inherit' };
 
-  // Auto-suggest next project ID
   const nextId = (() => {
     const nums = existingProjs.map(p => parseInt(p.id.replace(/\D/g,''))).filter(n => !isNaN(n));
     return `P${nums.length ? Math.max(...nums) + 1 : existingProjs.length + 1}`;
   })();
 
-  const [projId,   setProjId]   = useState(nextId);
-  const [projName, setProjName] = useState('');
-  const [color,    setColor]    = useState(PROJ_COLORS[existingProjs.length % PROJ_COLORS.length]);
-  const [tasks,    setTasks]    = useState([
-    { seq:'A', name:'', person:'', role:'', rate:'', start:'', end:'', deps:'' },
+  const [projId,    setProjId]   = useState(nextId);
+  const [projName,  setProjName] = useState('');
+  const [color,     setColor]    = useState(PROJ_COLORS[existingProjs.length % PROJ_COLORS.length]);
+  const [tasks,     setTasks]    = useState([
+    { seq:'A', name:'', person:'', role:'', rate:'', start:'', end:'', deps:[], depType:'FS' },
   ]);
-  const [error, setError] = useState('');
+  const [error,     setError]    = useState('');
+  const [workflows] = useState(() => loadWorkflows());
 
   const updateTask = (i, field, val) => setTasks(prev => prev.map((t, idx) => idx === i ? {...t, [field]:val} : t));
 
+  const toggleDep = (i, seq) => setTasks(prev => prev.map((t, idx) => {
+    if (idx !== i) return t;
+    const deps = t.deps.includes(seq) ? t.deps.filter(d => d !== seq) : [...t.deps, seq];
+    return { ...t, deps };
+  }));
+
   const addTaskRow = () => setTasks(prev => [...prev, {
-    seq: String.fromCharCode(65 + prev.length), name:'', person:'', role:'', rate:'', start:'', end:'', deps:''
+    seq: String.fromCharCode(65 + prev.length), name:'', person:'', role:'', rate:'', start:'', end:'', deps:[], depType:'FS'
   }]);
 
   const removeTask = i => setTasks(prev => prev.filter((_, idx) => idx !== i));
 
-  // Known people for autocomplete hint
+  const loadWorkflow = wfId => {
+    const wf = workflows.get(wfId);
+    if (!wf) return;
+    setTasks(wf.tasks.map((t, i) => ({
+      seq: String.fromCharCode(65 + i),
+      name: t.name, person:'', role: t.role||'', rate:'', start:'', end:'',
+      deps: t.deps || [], depType: t.depType || 'FS',
+    })));
+  };
+
   const knownNames = existingPeople.map(p => p.name);
 
   const handleAdd = () => {
     if (!projId.trim()) { setError('Project ID is required.'); return; }
     if (existingProjs.find(p => p.id === projId.trim())) { setError(`Project "${projId}" already exists.`); return; }
     if (!tasks.some(t => t.name.trim())) { setError('Add at least one task.'); return; }
-
     const validTasks = tasks.filter(t => t.name.trim() && t.start.trim() && t.end.trim());
     if (!validTasks.length) { setError('Each task needs a name, start date, and end date.'); return; }
 
     const pid = projId.trim().toUpperCase();
     const newProj = { id:pid, name: projName.trim() || `${pid} — New Build`, color };
 
-    // Build rawTasks entries
-    const newRawTasks = validTasks.map(t => {
-      const deps = t.deps ? t.deps.split(/[,;]+/).map(d => {
-        const c = d.trim();
-        if (!c) return null;
-        return c.includes('-') ? c : `${pid}-${c}`;
-      }).filter(Boolean) : [];
+    const newRawTasks = validTasks.map(t => ({
+      id:     `${pid}-${t.seq}`,
+      proj:   pid,
+      name:   t.name.trim(),
+      person: t.person.trim(),
+      role:   t.role.trim() || '',
+      dur:    1,
+      start:  t.start.trim(),
+      end:    t.end.trim(),
+      deps:   (t.deps || []).map(d => `${pid}-${d}`),
+    }));
 
-      return {
-        id:     `${pid}-${t.seq || t.name.slice(0,2).toUpperCase()}`,
-        proj:   pid,
-        name:   t.name.trim(),
-        person: t.person.trim(),
-        role:   t.role.trim() || '',
-        dur:    1, // approximated — engine computes from dates
-        start:  t.start.trim(),
-        end:    t.end.trim(),
-        deps,
-      };
-    });
+    const depMap = loadDepOverrides();
+    for (const t of validTasks) {
+      if ((t.deps || []).length) {
+        depMap.set(`${pid}-${t.seq}`, t.deps.map(d => ({ id:`${pid}-${d}`, type: t.depType || 'FS' })));
+      }
+    }
+    saveDepOverrides(depMap);
 
-    // Collect new people
     const newPeople = [];
     for (const t of newRawTasks) {
       if (t.person && !existingPeople.find(p => p.name === t.person) && !newPeople.find(p => p.name === t.person)) {
         const task = validTasks.find(vt => vt.name === t.name);
         const init = t.person.split(' ').map(w=>w[0]).join('').slice(0,2).toUpperCase();
-        newPeople.push({
-          name:  t.person,
-          role:  task?.role || '',
-          init,
-          color: PERSON_COLORS[(existingPeople.length + newPeople.length) % PERSON_COLORS.length],
-          rate:  task?.rate || '$42/hr',
-        });
+        newPeople.push({ name:t.person, role:task?.role||'', init, color:PERSON_COLORS[(existingPeople.length+newPeople.length)%PERSON_COLORS.length], rate:task?.rate||'$42/hr' });
       }
     }
 
@@ -3446,12 +4073,12 @@ function NewProjectModal({ existingProjs, existingPeople, onAdd, onClose }) {
     onClose();
   };
 
+  const wfList = [...workflows.values()];
+
   return (
     <div style={{ position:'fixed', inset:0, zIndex:1000, background:'rgba(10,10,15,0.7)', backdropFilter:'blur(4px)', display:'flex', alignItems:'center', justifyContent:'center' }}
       onClick={e => { if (e.target === e.currentTarget) onClose(); }}>
-      <div style={{ background:CARD, borderRadius:'16px', width:'560px', maxWidth:'95vw', maxHeight:'88vh', display:'flex', flexDirection:'column', boxShadow:'0 24px 64px rgba(0,0,0,0.5)', border:`1px solid ${BORDER}`, overflow:'hidden' }}>
-
-        {/* Header */}
+      <div style={{ background:CARD, borderRadius:'16px', width:'700px', maxWidth:'95vw', maxHeight:'88vh', display:'flex', flexDirection:'column', boxShadow:'0 24px 64px rgba(0,0,0,0.5)', border:`1px solid ${BORDER}`, overflow:'hidden' }}>
         <div style={{ padding:'18px 22px 14px', borderBottom:`2px solid ${ORANGE}`, background:'#17171F', flexShrink:0 }}>
           <div style={{ display:'flex', alignItems:'center', justifyContent:'space-between' }}>
             <div>
@@ -3462,10 +4089,7 @@ function NewProjectModal({ existingProjs, existingPeople, onAdd, onClose }) {
           </div>
         </div>
 
-        {/* Scrollable body */}
         <div style={{ overflowY:'auto', flex:1, padding:'18px 22px' }}>
-
-          {/* Project details */}
           <div style={{ marginBottom:'20px' }}>
             <div style={{ fontSize:'11px', fontWeight:'700', color:MUTED, textTransform:'uppercase', letterSpacing:'0.07em', marginBottom:'10px' }}>Project Details</div>
             <div style={{ display:'grid', gridTemplateColumns:'1fr 2fr auto', gap:'10px', alignItems:'end' }}>
@@ -3475,7 +4099,7 @@ function NewProjectModal({ existingProjs, existingPeople, onAdd, onClose }) {
               </div>
               <div>
                 <div style={{ fontSize:'11px', color:MUTED, marginBottom:'5px' }}>Project Name</div>
-                <input value={projName} onChange={e => setProjName(e.target.value)} placeholder="New Build, Renovation…" style={INPUT} />
+                <input value={projName} onChange={e => setProjName(e.target.value)} placeholder="New Build, Renovation\u2026" style={INPUT} />
               </div>
               <div>
                 <div style={{ fontSize:'11px', color:MUTED, marginBottom:'5px' }}>Colour</div>
@@ -3488,32 +4112,60 @@ function NewProjectModal({ existingProjs, existingPeople, onAdd, onClose }) {
             </div>
           </div>
 
-          {/* Task rows */}
           <div>
-            <div style={{ fontSize:'11px', fontWeight:'700', color:MUTED, textTransform:'uppercase', letterSpacing:'0.07em', marginBottom:'10px' }}>Tasks</div>
+            <div style={{ display:'flex', alignItems:'center', justifyContent:'space-between', marginBottom:'10px' }}>
+              <div style={{ fontSize:'11px', fontWeight:'700', color:MUTED, textTransform:'uppercase', letterSpacing:'0.07em' }}>Tasks</div>
+              {wfList.length > 0 && (
+                <div style={{ display:'flex', alignItems:'center', gap:'8px' }}>
+                  <span style={{ fontSize:'11px', color:MUTED }}>From workflow:</span>
+                  <select onChange={e => { if (e.target.value) loadWorkflow(e.target.value); e.target.value=''; }}
+                    style={{ padding:'4px 8px', borderRadius:'7px', border:`1px solid ${BORDER}`, background:'#0F0F18', color:TEXT, fontSize:'11px', outline:'none', cursor:'pointer' }}>
+                    <option value=''>\u2014 select \u2014</option>
+                    {wfList.map(wf => <option key={wf.id} value={wf.id}>{wf.name}</option>)}
+                  </select>
+                </div>
+              )}
+            </div>
 
-            {/* Column headers */}
-            <div style={{ display:'grid', gridTemplateColumns:'32px 1fr 100px 90px 90px 80px 24px', gap:'6px', marginBottom:'6px', paddingBottom:'6px', borderBottom:`1px solid ${BORDER}` }}>
-              {['ID','Task Name','Assigned','Start','End','Deps',''].map((h,i) => (
+            <div style={{ display:'grid', gridTemplateColumns:'32px 1fr 100px 90px 90px 160px 24px', gap:'6px', marginBottom:'6px', paddingBottom:'6px', borderBottom:`1px solid ${BORDER}` }}>
+              {['ID','Task Name','Assigned','Start','End','Dependencies',''].map((h,i) => (
                 <div key={i} style={{ fontSize:'10px', color:MUTED, fontWeight:'600', textTransform:'uppercase', letterSpacing:'0.05em' }}>{h}</div>
               ))}
             </div>
 
-            {tasks.map((t, i) => (
-              <div key={i} style={{ display:'grid', gridTemplateColumns:'32px 1fr 100px 90px 90px 80px 24px', gap:'6px', marginBottom:'6px', alignItems:'center' }}>
-                <div style={{ fontSize:'12px', fontWeight:'700', color:ORANGE, textAlign:'center', background:'#F9731615', borderRadius:'5px', padding:'6px 0', border:`1px solid ${ORANGE}40` }}>{projId}-{t.seq}</div>
-                <input value={t.name} onChange={e => updateTask(i,'name',e.target.value)} placeholder="Task name" style={INPUT} />
-                <input value={t.person} onChange={e => updateTask(i,'person',e.target.value)} placeholder="Name" list="known-people" style={INPUT} />
-                <input value={t.start} onChange={e => updateTask(i,'start',e.target.value)} placeholder="DD/MM/YYYY" style={INPUT} />
-                <input value={t.end}   onChange={e => updateTask(i,'end',  e.target.value)} placeholder="DD/MM/YYYY" style={INPUT} />
-                <input value={t.deps}  onChange={e => updateTask(i,'deps', e.target.value)} placeholder="A, B" style={INPUT} title="Comma-separated task letters, e.g. A, B" />
-                <button onClick={() => removeTask(i)} disabled={tasks.length === 1}
-                  style={{ width:'24px', height:'24px', borderRadius:'5px', border:`1px solid ${BORDER}`, background:'transparent', color:MUTED, cursor:tasks.length===1?'default':'pointer', fontSize:'14px', display:'flex', alignItems:'center', justifyContent:'center', flexShrink:0, opacity:tasks.length===1?0.3:1 }}>×</button>
-              </div>
-            ))}
+            {tasks.map((t, i) => {
+              const prevSeqs = tasks.slice(0, i).map(x => x.seq);
+              return (
+                <div key={i} style={{ display:'grid', gridTemplateColumns:'32px 1fr 100px 90px 90px 160px 24px', gap:'6px', marginBottom:'6px', alignItems:'center' }}>
+                  <div style={{ fontSize:'12px', fontWeight:'700', color:ORANGE, textAlign:'center', background:'#F9731615', borderRadius:'5px', padding:'6px 0', border:`1px solid ${ORANGE}40` }}>{projId}-{t.seq}</div>
+                  <input value={t.name}   onChange={e => updateTask(i,'name',  e.target.value)} placeholder="Task name"   style={INPUT} />
+                  <input value={t.person} onChange={e => updateTask(i,'person',e.target.value)} placeholder="Name" list="known-people-npm" style={INPUT} />
+                  <input value={t.start}  onChange={e => updateTask(i,'start', e.target.value)} placeholder="DD/MM/YYYY" style={INPUT} />
+                  <input value={t.end}    onChange={e => updateTask(i,'end',   e.target.value)} placeholder="DD/MM/YYYY" style={INPUT} />
+                  <div style={{ display:'flex', gap:'4px', flexWrap:'wrap', alignItems:'center' }}>
+                    <div style={{ display:'flex', borderRadius:'6px', overflow:'hidden', border:`1px solid ${BORDER}`, flexShrink:0 }}>
+                      {['FS','SS'].map(tp => (
+                        <button key={tp} onClick={() => updateTask(i,'depType',tp)}
+                          style={{ padding:'3px 7px', border:'none', cursor:'pointer', fontSize:'10px', fontWeight:'700', background: t.depType===tp ? ORANGE : 'transparent', color: t.depType===tp ? 'white' : MUTED }}>
+                          {tp}
+                        </button>
+                      ))}
+                    </div>
+                    {prevSeqs.map(seq => (
+                      <button key={seq} onClick={() => toggleDep(i, seq)}
+                        style={{ padding:'3px 8px', borderRadius:'5px', border:`1px solid ${t.deps.includes(seq) ? ORANGE : BORDER}`, background: t.deps.includes(seq) ? '#F9731620' : 'transparent', cursor:'pointer', fontSize:'10px', fontWeight:'700', color: t.deps.includes(seq) ? ORANGE : MUTED }}>
+                        {seq}
+                      </button>
+                    ))}
+                    {prevSeqs.length === 0 && <span style={{ fontSize:'10px', color:MUTED, fontStyle:'italic' }}>\u2014</span>}
+                  </div>
+                  <button onClick={() => removeTask(i)} disabled={tasks.length === 1}
+                    style={{ width:'24px', height:'24px', borderRadius:'5px', border:`1px solid ${BORDER}`, background:'transparent', color:MUTED, cursor:tasks.length===1?'default':'pointer', fontSize:'14px', display:'flex', alignItems:'center', justifyContent:'center', flexShrink:0, opacity:tasks.length===1?0.3:1 }}>×</button>
+                </div>
+              );
+            })}
 
-            {/* Known people datalist for autocomplete */}
-            <datalist id="known-people">
+            <datalist id="known-people-npm">
               {knownNames.map(n => <option key={n} value={n} />)}
             </datalist>
 
@@ -3525,24 +4177,20 @@ function NewProjectModal({ existingProjs, existingPeople, onAdd, onClose }) {
             </button>
           </div>
 
-          {error && (
-            <div style={{ marginTop:'14px', padding:'9px 12px', borderRadius:'8px', background:'#3B1219', border:'1px solid #7F1D1D', color:'#FCA5A5', fontSize:'12px' }}>
-              {error}
-            </div>
-          )}
+          {error && <div style={{ marginTop:'12px', padding:'9px 12px', borderRadius:'8px', background:'#3B1219', border:'1px solid #7F1D1D', color:'#FCA5A5', fontSize:'12px' }}>{error}</div>}
         </div>
 
-        {/* Footer */}
         <div style={{ padding:'14px 22px', borderTop:`1px solid ${BORDER}`, display:'flex', gap:'10px', justifyContent:'flex-end', flexShrink:0, background:'#17171F' }}>
           <button onClick={onClose} style={{ padding:'8px 18px', borderRadius:'8px', border:`1px solid ${BORDER}`, background:'transparent', color:MUTED, fontSize:'13px', cursor:'pointer' }}>Cancel</button>
           <button onClick={handleAdd} style={{ padding:'8px 22px', borderRadius:'8px', border:'none', background:ORANGE, color:'white', fontSize:'13px', fontWeight:'700', cursor:'pointer' }}>
-            + Add Project
+            Create Project
           </button>
         </div>
       </div>
     </div>
   );
 }
+
 
 export default function App() {
   const [schedData,    setSchedData]    = useState(null);
@@ -3606,6 +4254,7 @@ export default function App() {
     localStorage.removeItem(LS_EDITS_KEY);
     localStorage.removeItem(LS_COMPLETED_KEY);
     localStorage.removeItem(LS_STATUS_KEY);
+    localStorage.removeItem(LS_DEPS_KEY);
     setSchedData(null); setBaseData(null);
   };
 
@@ -3620,6 +4269,7 @@ export default function App() {
   // ── Empty state ────────────────────────────────────────────────────────────
   if (!schedData) {
     return (
+      <ErrorBoundary>
       <div style={{ fontFamily:'-apple-system,BlinkMacSystemFont,"Segoe UI",sans-serif', background:SURFACE, minHeight:'100vh', color:TEXT }}>
         <input ref={fileInputRef} type="file" accept=".xlsx,.xls" onChange={handleFileChange} style={{ display:'none' }} />
 
@@ -3701,11 +4351,13 @@ export default function App() {
           </div>
         </div>
       </div>
+      </ErrorBoundary>
     );
   }
 
   // ── Loaded ────────────────────────────────────────────────────────────────
   return (
+    <ErrorBoundary>
     <ScheduleCtx.Provider value={schedData}>
       {showNewProj && (
         <NewProjectModal
@@ -3717,6 +4369,7 @@ export default function App() {
       )}
       <ScheduleApp
         schedData={schedData}
+        baseData={baseData}
         onImport={triggerImport}
         onClear={clearData}
         onNewProject={() => setShowNewProj(true)}
@@ -3727,12 +4380,13 @@ export default function App() {
       />
       <input ref={fileInputRef} type="file" accept=".xlsx,.xls" onChange={handleFileChange} style={{ display:'none' }} />
     </ScheduleCtx.Provider>
+    </ErrorBoundary>
   );
 }
 
 
 // ── ScheduleApp — the full dashboard once data is loaded ──────────────────────
-function ScheduleApp({ schedData, onImport, onClear, onNewProject, onMutate, importing, importError, NAV, SURFACE, CARD, BORDER, ORANGE, TEXT, MUTED }) {
+function ScheduleApp({ schedData, baseData, onImport, onClear, onNewProject, onMutate, importing, importError, NAV, SURFACE, CARD, BORDER, ORANGE, TEXT, MUTED }) {
   const { rawTasks, projs, people, tdepMap, base, todayDay, periods } = schedData;
 
   const [simDelays,       setSimDelays]       = useState({});
@@ -3769,6 +4423,19 @@ function ScheduleApp({ schedData, onImport, onClear, onNewProject, onMutate, imp
       return next;
     });
   }, []);
+
+  // Save a full typed dep list for a task (replaces xlsx deps for that task)
+  const saveTaskDeps = useCallback((taskId, typedDeps) => {
+    // 1. Persist the override
+    const map = loadDepOverrides();
+    if (typedDeps.length === 0) map.delete(taskId);
+    else map.set(taskId, typedDeps);
+    saveDepOverrides(map);
+    // 2. Rebuild from baseData so applyEditsToData doesn't double-merge
+    if (!baseData) return;
+    const currentEdits = loadSchedEdits();
+    setSchedData(applyEditsToData(baseData, currentEdits));
+  }, [baseData]);
 
   const [tab,        setTab]        = useState('gantt');
   const [sel,        setSel]        = useState(null);
@@ -3860,7 +4527,7 @@ function ScheduleApp({ schedData, onImport, onClear, onNewProject, onMutate, imp
   const crossRisk     = projs.filter(p => tasks.filter(t => t.projId === p.id && !isEffectivelyCompleted(t)).some(t => t.isDV));
 
   const TAB_ITEMS = [
-    {id:'gantt',l:'Gantt Chart'},{id:'project',l:'Project View'},{id:'conflicts',l:'Conflicts'},{id:'people',l:'Resource'}
+    {id:'gantt',l:'Gantt Chart'},{id:'project',l:'Project View'},{id:'workflows',l:'Workflows'},{id:'conflicts',l:'Conflicts'},{id:'people',l:'Resource'}
   ];
 
   return (
@@ -3868,7 +4535,7 @@ function ScheduleApp({ schedData, onImport, onClear, onNewProject, onMutate, imp
       <div style={{ fontFamily:'-apple-system,BlinkMacSystemFont,"Segoe UI",sans-serif', background:SURFACE, minHeight:'100vh', color:TEXT }}>
 
         {editTarget && (
-          <EditModal target={editTarget} tasks={tasks} simDelays={simDelays} onApply={handleApply} onShift={handleShift} onClose={() => setEditTarget(null)} onDelete={handleDelete} statusOverrides={statusOverrides} onSetStatus={setStatusOverride} todayMs={todayMs} />
+          <EditModal target={editTarget} tasks={tasks} simDelays={simDelays} onApply={handleApply} onShift={handleShift} onClose={() => setEditTarget(null)} onDelete={handleDelete} statusOverrides={statusOverrides} onSetStatus={setStatusOverride} todayMs={todayMs} onSaveDeps={saveTaskDeps} />
         )}
 
         {addTasksProj && (
@@ -3983,6 +4650,7 @@ function ScheduleApp({ schedData, onImport, onClear, onNewProject, onMutate, imp
         <div style={{ margin:'14px 28px 28px', background:CARD, borderRadius:'12px', border:`1px solid ${BORDER}`, overflow:'hidden' }}>
           {tab==='gantt'     && <ProjectGanttTab tasks={tasks} simDelays={simDelays} setSimDelays={setSimDelays} onEdit={handleEdit} setAddTasksProj={setAddTasksProj} onToggleComplete={toggleComplete} statusOverrides={statusOverrides} todayMs={todayMs} />}
           {tab==='project'   && <ProjectViewTab tasks={tasks} onDelete={handleDelete} onEdit={handleEdit} onToggleComplete={toggleComplete} statusOverrides={statusOverrides} onSetStatus={setStatusOverride} todayMs={todayMs} />}
+          {tab==='workflows' && <WorkflowsTab />}
           {tab==='conflicts' && <ConflictsTab tasks={tasks} />}
           {tab==='people'    && <PeopleTab tasks={tasks} sel={sel} onSel={setSel} statusOverrides={statusOverrides} todayMs={todayMs} />}
         </div>
