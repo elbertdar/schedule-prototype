@@ -42,10 +42,13 @@ export const SBH = 38;   // person bar height
 
 // ── Roles ────────────────────────────────────────────────────────────────────
 // `people` is filled dynamically by ProjectGanttTab — see roleOf().
+// NOTE: `key` and `label` are required — ProjectGanttTab builds expand/collapse
+// keys from `role.key` and renders the header from `role.label`. Without them,
+// role keys become "P1-undefined" and the row labels render blank.
 export const ROLES = [
-  { id:'pm',  name:'Project Mgr',  color:'#8B5CF6', people:[] },
-  { id:'eng', name:'Engineers',    color:'#10B981', people:[] },
-  { id:'des', name:'Designers',    color:'#EC4899', people:[] },
+  { id:'pm',  key:'pm',  name:'Project Mgr', label:'Project Mgr', color:'#8B5CF6', people:[] },
+  { id:'eng', key:'eng', name:'Engineers',   label:'Engineers',   color:'#10B981', people:[] },
+  { id:'des', key:'des', name:'Designers',   label:'Designers',   color:'#EC4899', people:[] },
 ];
 
 /** Map a person name → role. Falls back to the first role if no match. */

@@ -7,7 +7,7 @@ import { useSched } from '../../context.jsx';
 import { fmtDate as fd } from '../../engine/dates.jsx';
 import { normDep } from '../../engine/schedule.jsx';
 import { computeStatus } from '../../engine/status.jsx';
-import { DPX, HH, LW, PRH, RRH, SRH, SBH, ROLES, ALL_MONS } from '../../theme.jsx';
+import { DPX, HH, LW, PRH, RRH, SRH, SBH, ALL_MONS } from '../../theme.jsx';
 
 export function ProjectGanttTab({ tasks, simDelays, setSimDelays, onEdit, setAddTasksProj, onToggleComplete, statusOverrides, todayMs }) {
   const { rawTasks, projs, people, tdepMap, base, todayDay, periods } = useSched();
@@ -25,8 +25,13 @@ export function ProjectGanttTab({ tasks, simDelays, setSimDelays, onEdit, setAdd
 
   const [showCompleted, setShowCompleted] = useState(true);
   const [expanded, setExpanded] = useState(() => {
+    // Start with every project AND every project-role expanded.
+    // Role keys are the actual role names from the people data (e.g.
+    // "Architect", "Draftee") — NOT the old hardcoded ROLES list, which
+    // never matched the imported data.
     const s = new Set(projs.map(p => p.id));
-    projs.forEach(p => ROLES.forEach(r => s.add(`${p.id}-${r.key}`)));
+    const roleNames = [...new Set(people.map(per => (per.role || 'Unassigned').trim() || 'Unassigned'))];
+    projs.forEach(p => roleNames.forEach(rn => s.add(`${p.id}-${rn}`)));
     return s;
   });
   const [hov, setHov]     = useState(null);
@@ -97,23 +102,35 @@ export function ProjectGanttTab({ tasks, simDelays, setSimDelays, onEdit, setAdd
 
   const txR = d => d * dpx;
 
-  // ── Scroll to project start when filter changes ───────────────────────────
+  // ── Auto-expand the filtered project(s) when the filter changes ────────────
+  // IMPORTANT: deps are ONLY [filterProj, filterPerson] — deliberately NOT dpx.
+  // Previously dpx was a dep, so any layout change that recomputed dpx would
+  // re-run this and force-add projects back into `expanded` — which sprang the
+  // user's collapse toggles right back open. Keep this effect filter-only.
   useEffect(() => {
     if (!filterProj && !filterPerson) {
       setShowDeps(false);
       return;
     }
     setShowDeps(true);
-    // Expand the filtered project(s)
     setExpanded(prev => {
       const next = new Set(prev);
       const targetProjs = filterProj ? [filterProj] : projs.map(p => p.id);
+      const roleNames = [...new Set(people.map(per => (per.role || 'Unassigned').trim() || 'Unassigned'))];
       targetProjs.forEach(pid => {
         next.add(pid);
-        ROLES.forEach(r => next.add(`${pid}-${r.key}`));
+        roleNames.forEach(rn => next.add(`${pid}-${rn}`));
       });
       return next;
     });
+  }, [filterProj, filterPerson]);
+
+  // ── Scroll to the filtered project's start ────────────────────────────────
+  // This one DOES depend on dpx (the scroll position is in dpx-scaled pixels).
+  // It only scrolls — it never touches `expanded` — so re-running it on dpx
+  // changes is harmless.
+  useEffect(() => {
+    if (!filterProj && !filterPerson) return;
     requestAnimationFrame(() => {
       if (!scrollRef.current) return;
       const relevantTasks = filterPerson
@@ -148,21 +165,46 @@ export function ProjectGanttTab({ tasks, simDelays, setSimDelays, onEdit, setAdd
         const withDur = pt.filter(t => t.cd > 0);
         const minSd = withDur.length ? Math.min(...withDur.map(t => t.sd)) : 0;
         const maxEd = withDur.length ? Math.max(...withDur.map(t => t.sd + t.cd)) : 0;
-        // Group people by role, only roles that appear in this project
-        const roleGroups = ROLES
-          .map(role => {
-            const members = people.filter(per =>
-              role.people.includes(per.name) && pt.some(t => t.person === per.name)
-            );
-            if (!members.length) return null;
-            return {
-              role,
-              personRows: members.map(per => ({
-                per, tasks: pt.filter(t => t.person === per.name).sort((a, b) => a.s - b.s),
-              })),
-            };
-          })
-          .filter(Boolean);
+
+        // ── Group people by role ────────────────────────────────────────────
+        // Roles are derived from the actual people in this project — each
+        // person carries a `.role` string from the imported xlsx. The old
+        // code grouped against a hardcoded ROLES list whose `.people` arrays
+        // were never populated, so roleGroups always came back empty and no
+        // role/person rows ever rendered. This builds the groups from real data.
+        //
+        // Find the people who actually have (visible) tasks in this project:
+        const projPeople = people.filter(per => pt.some(t => t.person === per.name));
+
+        // Distinct role names, in first-seen order:
+        const roleNames = [];
+        for (const per of projPeople) {
+          const rn = (per.role || 'Unassigned').trim() || 'Unassigned';
+          if (!roleNames.includes(rn)) roleNames.push(rn);
+        }
+
+        // Build a role group per distinct role name. We synthesize the
+        // {key, label, color} shape the renderer expects. Colour falls back
+        // to the project colour so it always has something sensible.
+        const roleGroups = roleNames.map(roleName => {
+          const members = projPeople.filter(
+            per => ((per.role || 'Unassigned').trim() || 'Unassigned') === roleName
+          );
+          if (!members.length) return null;
+          const role = {
+            key:   roleName,                       // used to build expand/collapse keys
+            label: roleName,                       // shown in the role row header
+            color: members[0].color || proj.color, // colour from first member, or project
+          };
+          return {
+            role,
+            personRows: members.map(per => ({
+              per,
+              tasks: pt.filter(t => t.person === per.name).sort((a, b) => a.s - b.s),
+            })),
+          };
+        }).filter(Boolean);
+
         return { proj, pt, minSd, maxEd, roleGroups };
       })
       .filter(pd => pd.pt.length > 0 || !filterPerson); // hide projects with no matching tasks when filtering by person
@@ -192,7 +234,6 @@ export function ProjectGanttTab({ tasks, simDelays, setSimDelays, onEdit, setAdd
     return { rowList: list, totalH: y };
   }, [projData, expanded]);
 
-  const W = LW + TD * DPX;
   const ht = hov ? tasks.find(t => t.id === hov) : null;
 
   // Pixel positions for every visible task:
@@ -681,7 +722,7 @@ export function ProjectGanttTab({ tasks, simDelays, setSimDelays, onEdit, setAdd
                   <rect x={0} y={y} width={TD*dpx} height={SRH} fill="#13131A" />
                   <line x1={0} y1={y+SRH} x2={TD*dpx} y2={y+SRH} stroke="#2A2A3A" strokeWidth="1" />
                   {pTasks.map(t => {
-                    const x = txR(t.sd), w = Math.max(t.cd*DPX, t.cd?4:0);
+                    const x = txR(t.sd), w = Math.max(t.cd*dpx, t.cd?4:0);
                     const ih = hov===t.id;
                     const dimmed = showDeps && hov && !hovRelated.has(t.id);
                     if (!t.cd) return (
@@ -808,6 +849,22 @@ export function ProjectGanttTab({ tasks, simDelays, setSimDelays, onEdit, setAdd
                   const r = 4;
                   const isFS = depType !== 'SS';
 
+                  // ── Scale-aware horizontal offsets ────────────────────────
+                  // The routing constants below used to be fixed pixel values
+                  // (16, 10) tuned at the default zoom (dpx ≈ 9). When the
+                  // project filter is on, dpx jumps to 20–48 and those fixed
+                  // offsets became too small relative to the spread-out bars,
+                  // making lines look cramped / out of whack.
+                  //
+                  // SIDE  — how far a line steps sideways before routing around
+                  //         a bar. Grows with zoom but is clamped so it never
+                  //         gets absurd.
+                  // STUB  — the short horizontal nub off a bar edge before the
+                  //         first turn.
+                  // These are the knobs to tweak if the look still needs work.
+                  const SIDE = Math.min(40, Math.max(16, dpx * 1.4));
+                  const STUB = Math.min(24, Math.max(10, dpx * 0.9));
+
                   // FS: exits right edge of dep, enters left edge of target
                   // SS: exits left edge of dep, enters left edge of target
                   const x1 = isFS ? from.xe : from.xs;
@@ -825,7 +882,7 @@ export function ProjectGanttTab({ tasks, simDelays, setSimDelays, onEdit, setAdd
                   if (!isFS) {
                     // ── SS routing: left exit → left entry ────────────────────
                     // Exit left from source, loop above/below, enter left of target
-                    const loopX = Math.min(x1, x4) - 16;
+                    const loopX = Math.min(x1, x4) - SIDE;
                     if (sameRow) {
                       // Same row: loop above
                       const archY = y1 - SBH * 0.9;
@@ -865,13 +922,13 @@ export function ProjectGanttTab({ tasks, simDelays, setSimDelays, onEdit, setAdd
                   } else if (sameRow && gap <= 0) {
                     // ── FS, same row, backward: loop below ────────────────────
                     const loopY  = y1 + SBH * 0.9;
-                    const loopX  = Math.min(x1, x4) - 16;
+                    const loopX  = Math.min(x1, x4) - SIDE;
                     pathD = [
                       `M ${x1} ${y1}`,
-                      `L ${x1 + 10} ${y1}`,
-                      `Q ${x1 + 10 + r} ${y1} ${x1 + 10 + r} ${y1 + r}`,
-                      `L ${x1 + 10 + r} ${loopY - r}`,
-                      `Q ${x1 + 10 + r} ${loopY} ${x1 + 10} ${loopY}`,
+                      `L ${x1 + STUB} ${y1}`,
+                      `Q ${x1 + STUB + r} ${y1} ${x1 + STUB + r} ${y1 + r}`,
+                      `L ${x1 + STUB + r} ${loopY - r}`,
+                      `Q ${x1 + STUB + r} ${loopY} ${x1 + STUB} ${loopY}`,
                       `L ${loopX + r} ${loopY}`,
                       `Q ${loopX} ${loopY} ${loopX} ${loopY - r}`,
                       `L ${loopX} ${y4 + r}`,
@@ -889,17 +946,37 @@ export function ProjectGanttTab({ tasks, simDelays, setSimDelays, onEdit, setAdd
                       `Q ${xMid} ${y4} ${xMid + r} ${y4}`,
                       `L ${x4} ${y4}`,
                     ].join(' ');
+                  } else if (gap > -SIDE) {
+                    // ── FS, different rows, slight overlap / near-aligned ─────
+                    // Target is only slightly behind (or barely ahead of) the
+                    // source's end — not a TRUE backward dependency. A short
+                    // step-out + drop reads far cleaner than the full loop.
+                    // We route just past the source's right edge, drop to the
+                    // target's row, and come in from the left. `xKnee` is
+                    // clamped so it never lands left of where we started.
+                    const xKnee = Math.max(x1 + STUB, x4 - STUB);
+                    pathD = [
+                      `M ${x1} ${y1}`,
+                      `L ${xKnee - r} ${y1}`,
+                      `Q ${xKnee} ${y1} ${xKnee} ${y1 + (goDown ? r : -r)}`,
+                      `L ${xKnee} ${y4 + (goDown ? -r : r)}`,
+                      `Q ${xKnee} ${y4} ${xKnee + r} ${y4}`,
+                      `L ${x4} ${y4}`,
+                    ].join(' ');
                   } else {
-                    // ── FS, backward / overlap ────────────────────────────────
-                    const stub   = 10;
-                    const loopX  = Math.min(x1, x4) - 16;
+                    // ── FS, genuine backward dependency ───────────────────────
+                    // Target starts meaningfully BEHIND the source's end, on a
+                    // different row. A simple elbow can't reach it without
+                    // cutting backward through content, so a tidy loop is
+                    // correct here — this is the case we deliberately keep.
+                    const loopX  = Math.min(x1, x4) - SIDE;
                     const midY   = y1 + rowDiff / 2;
                     pathD = [
                       `M ${x1} ${y1}`,
-                      `L ${x1 + stub} ${y1}`,
-                      `Q ${x1 + stub + r} ${y1} ${x1 + stub + r} ${y1 + (goDown ? r : -r)}`,
-                      `L ${x1 + stub + r} ${midY + (goDown ? -r : r)}`,
-                      `Q ${x1 + stub + r} ${midY} ${x1 + stub} ${midY}`,
+                      `L ${x1 + STUB} ${y1}`,
+                      `Q ${x1 + STUB + r} ${y1} ${x1 + STUB + r} ${y1 + (goDown ? r : -r)}`,
+                      `L ${x1 + STUB + r} ${midY + (goDown ? -r : r)}`,
+                      `Q ${x1 + STUB + r} ${midY} ${x1 + STUB} ${midY}`,
                       `L ${loopX + r} ${midY}`,
                       `Q ${loopX} ${midY} ${loopX} ${midY + (goDown ? r : -r)}`,
                       `L ${loopX} ${y4 + (goDown ? -r : r)}`,
